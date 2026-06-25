@@ -2,7 +2,7 @@
 /**
  * Plugin Name: OC WebP Media Converter
  * Description: Converts JPG/JPEG/PNG Media Library attachments to WebP, updates attachment records, regenerates image sizes, optionally updates database references, and optionally removes original files.
- * Version: 0.1.0
+ * Version: 0.2.0
  * Author: TriAd/ChatGPT
  * License: GPL-2.0-or-later
  */
@@ -12,11 +12,59 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 class OC_WebP_Media_Converter {
-	const PAGE_SLUG = 'oc-webp-media-converter';
-	const NONCE_ACTION = 'oc_webp_media_converter_run';
+	const PAGE_SLUG        = 'oc-webp-media-converter';
+	const NONCE_ACTION     = 'oc_webp_media_converter_run';
+	const ERROR_NONCE      = 'oc_webp_media_converter_error_log';
+	const DB_VERSION       = '1.0';
+	const DB_VERSION_OPTION = 'oc_webp_media_converter_db_version';
 
 	public function __construct() {
 		add_action( 'admin_menu', array( $this, 'add_admin_page' ) );
+		add_action( 'admin_init', array( $this, 'maybe_upgrade_db' ) );
+	}
+
+	public static function activate() {
+		self::create_error_log_table();
+		update_option( self::DB_VERSION_OPTION, self::DB_VERSION );
+	}
+
+	public function maybe_upgrade_db() {
+		if ( get_option( self::DB_VERSION_OPTION ) !== self::DB_VERSION || ! $this->table_exists( self::get_error_log_table_name() ) ) {
+			self::create_error_log_table();
+			update_option( self::DB_VERSION_OPTION, self::DB_VERSION );
+		}
+	}
+
+	public static function get_error_log_table_name() {
+		global $wpdb;
+		return $wpdb->prefix . 'oc_webp_error_log';
+	}
+
+	private static function create_error_log_table() {
+		global $wpdb;
+
+		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+		$table_name      = self::get_error_log_table_name();
+		$charset_collate = $wpdb->get_charset_collate();
+
+		$sql = "CREATE TABLE {$table_name} (
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			attachment_id bigint(20) unsigned NOT NULL DEFAULT 0,
+			old_file text NULL,
+			old_relative varchar(512) NOT NULL DEFAULT '',
+			target_relative varchar(512) NOT NULL DEFAULT '',
+			error_message text NOT NULL,
+			occurrences bigint(20) unsigned NOT NULL DEFAULT 1,
+			created_at datetime NOT NULL,
+			last_seen_at datetime NOT NULL,
+			PRIMARY KEY  (id),
+			UNIQUE KEY attachment_id (attachment_id),
+			KEY last_seen_at (last_seen_at),
+			KEY target_relative (target_relative(191))
+		) {$charset_collate};";
+
+		dbDelta( $sql );
 	}
 
 	public function add_admin_page() {
@@ -34,6 +82,8 @@ class OC_WebP_Media_Converter {
 			wp_die( esc_html__( 'You do not have permission to access this page.', 'oc-webp-media-converter' ) );
 		}
 
+		$this->maybe_upgrade_db();
+
 		$defaults = array(
 			'batch_size'       => 5,
 			'quality'          => 82,
@@ -43,8 +93,26 @@ class OC_WebP_Media_Converter {
 			'backup_originals' => 1,
 		);
 
-		$options = $defaults;
-		$results = array();
+		$options     = $defaults;
+		$results     = array();
+		$notice      = '';
+		$current_tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'converter';
+		if ( ! in_array( $current_tab, array( 'converter', 'error-log' ), true ) ) {
+			$current_tab = 'converter';
+		}
+
+		if ( isset( $_POST['ocwc_delete_error'] ) ) {
+			check_admin_referer( self::ERROR_NONCE, 'ocwc_error_nonce' );
+
+			$error_id = absint( $_POST['error_id'] ?? 0 );
+			if ( $error_id && $this->delete_error_entry( $error_id ) ) {
+				$notice = 'Error log entry deleted. That attachment can be processed again in a future batch.';
+			} else {
+				$notice = 'Could not delete that error log entry.';
+			}
+
+			$current_tab = 'error-log';
+		}
 
 		if ( isset( $_POST['ocwc_run_batch'] ) ) {
 			check_admin_referer( self::NONCE_ACTION, 'ocwc_nonce' );
@@ -58,91 +126,273 @@ class OC_WebP_Media_Converter {
 				'backup_originals' => ! empty( $_POST['backup_originals'] ) ? 1 : 0,
 			);
 
-			$results = $this->run_batch( $options );
+			$results     = $this->run_batch( $options );
+			$current_tab = 'converter';
 		}
 
-		$remaining = $this->get_remaining_count();
+		$remaining      = $this->get_remaining_count();
+		$error_count    = $this->get_error_log_count();
 		$webp_supported = wp_image_editor_supports( array( 'mime_type' => 'image/webp' ) );
 
 		?>
 		<div class="wrap">
 			<h1>OC WebP Media Converter</h1>
 
-			<?php if ( ! $webp_supported ) : ?>
-				<div class="notice notice-error"><p><strong>WebP is not supported by the current server image editor.</strong> Your GD/Imagick setup must support WebP before conversion can run.</p></div>
+			<?php $this->render_tabs( $current_tab ); ?>
+
+			<?php if ( ! empty( $notice ) ) : ?>
+				<div class="notice notice-success is-dismissible"><p><?php echo esc_html( $notice ); ?></p></div>
 			<?php endif; ?>
 
-			<div class="notice notice-warning">
-				<p><strong>Make a full file and database backup before using this.</strong> This plugin can rewrite database references and delete original image files.</p>
-				<p>Run a small batch first, confirm the site still looks correct, then continue.</p>
-			</div>
+			<?php if ( 'error-log' === $current_tab ) : ?>
+				<?php $this->render_error_log_tab(); ?>
+			<?php else : ?>
+				<?php if ( ! $webp_supported ) : ?>
+					<div class="notice notice-error"><p><strong>WebP is not supported by the current server image editor.</strong> Your GD/Imagick setup must support WebP before conversion can run.</p></div>
+				<?php endif; ?>
 
-			<p><strong>Remaining JPG/PNG attachments:</strong> <?php echo esc_html( number_format_i18n( $remaining ) ); ?></p>
+				<div class="notice notice-warning">
+					<p><strong>Make a full file and database backup before using this.</strong> This plugin can rewrite database references and delete original image files.</p>
+					<p>Run a small batch first, confirm the site still looks correct, then continue.</p>
+				</div>
 
-			<form method="post">
-				<?php wp_nonce_field( self::NONCE_ACTION, 'ocwc_nonce' ); ?>
+				<p><strong>Remaining processable JPG/PNG attachments:</strong> <?php echo esc_html( number_format_i18n( $remaining ) ); ?></p>
+				<p><strong>Attachments currently skipped because they are in the error log:</strong> <?php echo esc_html( number_format_i18n( $error_count ) ); ?>. Delete an error entry from the Error Log tab if you want that attachment to be attempted again.</p>
 
-				<table class="form-table" role="presentation">
-					<tr>
-						<th scope="row"><label for="batch_size">Batch size</label></th>
-						<td><input name="batch_size" id="batch_size" type="number" min="1" max="25" value="<?php echo esc_attr( $options['batch_size'] ); ?>" /> <p class="description">Start with 1–5. Larger batches can time out on shared hosting.</p></td>
-					</tr>
-					<tr>
-						<th scope="row"><label for="quality">WebP quality</label></th>
-						<td><input name="quality" id="quality" type="number" min="1" max="100" value="<?php echo esc_attr( $options['quality'] ); ?>" /> <p class="description">82 is a good starting point.</p></td>
-					</tr>
-					<tr>
-						<th scope="row"><label for="max_width">Maximum width</label></th>
-						<td><input name="max_width" id="max_width" type="number" min="0" value="<?php echo esc_attr( $options['max_width'] ); ?>" /> <p class="description">Use 0 to keep original dimensions. Example: 1800 resizes only images wider than 1800px.</p></td>
-					</tr>
-					<tr>
-						<th scope="row">Database references</th>
-						<td><label><input name="update_refs" type="checkbox" value="1" <?php checked( $options['update_refs'], 1 ); ?> /> Replace JPG/PNG URLs and upload paths in posts, postmeta, options, termmeta, usermeta, and commentmeta.</label></td>
-					</tr>
-					<tr>
-						<th scope="row">Original files</th>
-						<td>
-							<label><input name="backup_originals" type="checkbox" value="1" <?php checked( $options['backup_originals'], 1 ); ?> /> Back up originals before deletion to <code>wp-content/uploads/oc-webp-backup/</code>.</label><br />
-							<label><input name="delete_originals" type="checkbox" value="1" <?php checked( $options['delete_originals'], 1 ); ?> /> Delete original JPG/PNG files and their old generated sizes after conversion.</label>
-						</td>
-					</tr>
-				</table>
+				<form method="post">
+					<?php wp_nonce_field( self::NONCE_ACTION, 'ocwc_nonce' ); ?>
 
-				<p><button class="button button-primary" name="ocwc_run_batch" value="1" <?php disabled( ! $webp_supported ); ?>>Run Next Batch</button></p>
-			</form>
-
-			<?php if ( ! empty( $results ) ) : ?>
-				<h2>Batch Results</h2>
-				<table class="widefat striped">
-					<thead><tr><th>Attachment ID</th><th>Status</th><th>Message</th></tr></thead>
-					<tbody>
-					<?php foreach ( $results as $result ) : ?>
+					<table class="form-table" role="presentation">
 						<tr>
-							<td><?php echo esc_html( $result['id'] ); ?></td>
-							<td><?php echo $result['success'] ? '<span style="color:green;">Converted</span>' : '<span style="color:#b32d2e;">Skipped/Error</span>'; ?></td>
-							<td><?php echo esc_html( $result['message'] ); ?></td>
+							<th scope="row"><label for="batch_size">Batch size</label></th>
+							<td><input name="batch_size" id="batch_size" type="number" min="1" max="25" value="<?php echo esc_attr( $options['batch_size'] ); ?>" /> <p class="description">Start with 1–5. Larger batches can time out on shared hosting.</p></td>
 						</tr>
-					<?php endforeach; ?>
-					</tbody>
-				</table>
+						<tr>
+							<th scope="row"><label for="quality">WebP quality</label></th>
+							<td><input name="quality" id="quality" type="number" min="1" max="100" value="<?php echo esc_attr( $options['quality'] ); ?>" /> <p class="description">82 is a good starting point.</p></td>
+						</tr>
+						<tr>
+							<th scope="row"><label for="max_width">Maximum width</label></th>
+							<td><input name="max_width" id="max_width" type="number" min="0" value="<?php echo esc_attr( $options['max_width'] ); ?>" /> <p class="description">Use 0 to keep original dimensions. Example: 1800 resizes only images wider than 1800px.</p></td>
+						</tr>
+						<tr>
+							<th scope="row">Database references</th>
+							<td><label><input name="update_refs" type="checkbox" value="1" <?php checked( $options['update_refs'], 1 ); ?> /> Replace JPG/PNG URLs and upload paths in posts, postmeta, options, termmeta, usermeta, and commentmeta.</label></td>
+						</tr>
+						<tr>
+							<th scope="row">Original files</th>
+							<td>
+								<label><input name="backup_originals" type="checkbox" value="1" <?php checked( $options['backup_originals'], 1 ); ?> /> Back up originals before deletion to <code>wp-content/uploads/oc-webp-backup/</code>.</label><br />
+								<label><input name="delete_originals" type="checkbox" value="1" <?php checked( $options['delete_originals'], 1 ); ?> /> Delete original JPG/PNG files and their old generated sizes after conversion.</label>
+							</td>
+						</tr>
+					</table>
+
+					<p><button class="button button-primary" name="ocwc_run_batch" value="1" <?php disabled( ! $webp_supported ); ?>>Run Next Batch</button></p>
+				</form>
+
+				<?php if ( ! empty( $results ) ) : ?>
+					<h2>Batch Results</h2>
+					<table class="widefat striped">
+						<thead><tr><th>Attachment ID</th><th>Status</th><th>Message</th></tr></thead>
+						<tbody>
+						<?php foreach ( $results as $result ) : ?>
+							<tr>
+								<td><?php echo esc_html( $result['id'] ); ?></td>
+								<td><?php echo $result['success'] ? '<span style="color:green;">Converted</span>' : '<span style="color:#b32d2e;">Skipped/Error</span>'; ?></td>
+								<td><?php echo esc_html( $result['message'] ); ?></td>
+							</tr>
+						<?php endforeach; ?>
+						</tbody>
+					</table>
+				<?php endif; ?>
 			<?php endif; ?>
 		</div>
 		<?php
 	}
 
-	private function get_remaining_count() {
-		$query = new WP_Query(
+	private function render_tabs( $current_tab ) {
+		$converter_url = add_query_arg(
 			array(
-				'post_type'      => 'attachment',
-				'post_status'    => 'inherit',
-				'post_mime_type' => array( 'image/jpeg', 'image/png' ),
-				'posts_per_page' => 1,
-				'fields'         => 'ids',
-				'no_found_rows'  => false,
-			)
+				'page' => self::PAGE_SLUG,
+			),
+			admin_url( 'tools.php' )
 		);
 
-		return (int) $query->found_posts;
+		$error_url = add_query_arg(
+			array(
+				'page' => self::PAGE_SLUG,
+				'tab'  => 'error-log',
+			),
+			admin_url( 'tools.php' )
+		);
+		?>
+		<h2 class="nav-tab-wrapper">
+			<a href="<?php echo esc_url( $converter_url ); ?>" class="nav-tab <?php echo 'converter' === $current_tab ? 'nav-tab-active' : ''; ?>">Converter</a>
+			<a href="<?php echo esc_url( $error_url ); ?>" class="nav-tab <?php echo 'error-log' === $current_tab ? 'nav-tab-active' : ''; ?>">Error Log</a>
+		</h2>
+		<?php
+	}
+
+	private function render_error_log_tab() {
+		$per_page = 50;
+		$paged    = max( 1, absint( $_GET['paged'] ?? 1 ) );
+		$total    = $this->get_error_log_count();
+		$entries  = $this->get_error_log_entries( $paged, $per_page );
+		?>
+		<h2>Error Log</h2>
+		<p>Attachments listed here are skipped during future batches. Delete an entry only when you want the converter to try that attachment again.</p>
+
+		<?php if ( empty( $entries ) ) : ?>
+			<p>No error log entries yet.</p>
+		<?php else : ?>
+			<table class="widefat striped">
+				<thead>
+					<tr>
+						<th>Attachment ID</th>
+						<th>Current File</th>
+						<th>Target WebP Path</th>
+						<th>Error Message</th>
+						<th>Occurrences</th>
+						<th>First Logged</th>
+						<th>Last Seen</th>
+						<th>Action</th>
+					</tr>
+				</thead>
+				<tbody>
+				<?php foreach ( $entries as $entry ) : ?>
+					<?php
+					$edit_link = get_edit_post_link( (int) $entry->attachment_id );
+					$title     = get_the_title( (int) $entry->attachment_id );
+					$label     = $title ? $entry->attachment_id . ' - ' . $title : $entry->attachment_id;
+					?>
+					<tr>
+						<td>
+							<?php if ( $edit_link ) : ?>
+								<a href="<?php echo esc_url( $edit_link ); ?>"><?php echo esc_html( $label ); ?></a>
+							<?php else : ?>
+								<?php echo esc_html( $label ); ?>
+							<?php endif; ?>
+						</td>
+						<td><code><?php echo esc_html( $entry->old_relative ); ?></code></td>
+						<td><code><?php echo esc_html( $entry->target_relative ); ?></code></td>
+						<td><?php echo esc_html( $entry->error_message ); ?></td>
+						<td><?php echo esc_html( number_format_i18n( (int) $entry->occurrences ) ); ?></td>
+						<td><?php echo esc_html( $entry->created_at ); ?></td>
+						<td><?php echo esc_html( $entry->last_seen_at ); ?></td>
+						<td>
+							<form method="post" style="display:inline;">
+								<?php wp_nonce_field( self::ERROR_NONCE, 'ocwc_error_nonce' ); ?>
+								<input type="hidden" name="error_id" value="<?php echo esc_attr( (int) $entry->id ); ?>" />
+								<button type="submit" class="button button-small" name="ocwc_delete_error" value="1" onclick="return confirm('Delete this error log entry? This attachment will be eligible for processing again.');">Delete</button>
+							</form>
+						</td>
+					</tr>
+				<?php endforeach; ?>
+				</tbody>
+			</table>
+
+			<?php
+			$total_pages = (int) ceil( $total / $per_page );
+			if ( $total_pages > 1 ) {
+				$pagination = paginate_links(
+					array(
+						'base'      => add_query_arg(
+							array(
+								'page'  => self::PAGE_SLUG,
+								'tab'   => 'error-log',
+								'paged' => '%#%',
+							),
+							admin_url( 'tools.php' )
+						),
+						'format'    => '',
+						'prev_text' => '&laquo;',
+						'next_text' => '&raquo;',
+						'total'     => $total_pages,
+						'current'   => $paged,
+					)
+				);
+
+				if ( $pagination ) {
+					echo '<div class="tablenav"><div class="tablenav-pages">' . wp_kses_post( $pagination ) . '</div></div>';
+				}
+			}
+			?>
+		<?php endif; ?>
+		<?php
+	}
+
+	private function get_remaining_count() {
+		global $wpdb;
+
+		$table = self::get_error_log_table_name();
+
+		$sql = "SELECT COUNT(1)
+			FROM {$wpdb->posts} p
+			LEFT JOIN `{$table}` e ON e.attachment_id = p.ID
+			WHERE p.post_type = 'attachment'
+			AND p.post_status = 'inherit'
+			AND p.post_mime_type IN ('image/jpeg', 'image/png')
+			AND e.attachment_id IS NULL";
+
+		return (int) $wpdb->get_var( $sql );
+	}
+
+	private function get_candidate_attachment_ids( $limit ) {
+		global $wpdb;
+
+		$table = self::get_error_log_table_name();
+		$limit = max( 1, (int) $limit );
+
+		$sql = $wpdb->prepare(
+			"SELECT p.ID
+			FROM {$wpdb->posts} p
+			LEFT JOIN `{$table}` e ON e.attachment_id = p.ID
+			WHERE p.post_type = 'attachment'
+			AND p.post_status = 'inherit'
+			AND p.post_mime_type IN ('image/jpeg', 'image/png')
+			AND e.attachment_id IS NULL
+			ORDER BY p.ID ASC
+			LIMIT %d",
+			$limit
+		);
+
+		return array_map( 'intval', (array) $wpdb->get_col( $sql ) );
+	}
+
+	private function get_error_log_count() {
+		global $wpdb;
+
+		$table = self::get_error_log_table_name();
+		return (int) $wpdb->get_var( "SELECT COUNT(1) FROM `{$table}`" );
+	}
+
+	private function get_error_log_entries( $paged, $per_page ) {
+		global $wpdb;
+
+		$table  = self::get_error_log_table_name();
+		$offset = max( 0, ( (int) $paged - 1 ) * (int) $per_page );
+
+		$sql = $wpdb->prepare(
+			"SELECT * FROM `{$table}` ORDER BY last_seen_at DESC, id DESC LIMIT %d OFFSET %d",
+			(int) $per_page,
+			(int) $offset
+		);
+
+		return (array) $wpdb->get_results( $sql );
+	}
+
+	private function delete_error_entry( $error_id ) {
+		global $wpdb;
+
+		$table  = self::get_error_log_table_name();
+		$result = $wpdb->delete(
+			$table,
+			array( 'id' => (int) $error_id ),
+			array( '%d' )
+		);
+
+		return false !== $result && $result > 0;
 	}
 
 	private function run_batch( $options ) {
@@ -156,30 +406,20 @@ class OC_WebP_Media_Converter {
 			);
 		}
 
-		$query = new WP_Query(
-			array(
-				'post_type'      => 'attachment',
-				'post_status'    => 'inherit',
-				'post_mime_type' => array( 'image/jpeg', 'image/png' ),
-				'posts_per_page' => (int) $options['batch_size'],
-				'fields'         => 'ids',
-				'orderby'        => 'ID',
-				'order'          => 'ASC',
-			)
-		);
+		$attachment_ids = $this->get_candidate_attachment_ids( (int) $options['batch_size'] );
 
-		if ( empty( $query->posts ) ) {
+		if ( empty( $attachment_ids ) ) {
 			return array(
 				array(
 					'id'      => '-',
 					'success' => true,
-					'message' => 'No JPG or PNG attachments remain.',
+					'message' => 'No processable JPG or PNG attachments remain. Attachments in the error log are skipped until their error entries are deleted.',
 				),
 			);
 		}
 
 		$results = array();
-		foreach ( $query->posts as $attachment_id ) {
+		foreach ( $attachment_ids as $attachment_id ) {
 			$results[] = $this->convert_attachment( (int) $attachment_id, $options );
 		}
 
@@ -287,10 +527,75 @@ class OC_WebP_Media_Converter {
 	}
 
 	private function result( $id, $success, $message ) {
+		if ( ! $success && is_numeric( $id ) && (int) $id > 0 ) {
+			$this->log_error( (int) $id, $message );
+		}
+
 		return array(
 			'id'      => $id,
 			'success' => (bool) $success,
 			'message' => $message,
+		);
+	}
+
+	private function log_error( $attachment_id, $message ) {
+		global $wpdb;
+
+		$this->maybe_upgrade_db();
+
+		$table           = self::get_error_log_table_name();
+		$old_file        = get_attached_file( $attachment_id );
+		$old_file        = $old_file ? wp_normalize_path( $old_file ) : '';
+		$old_relative    = (string) get_post_meta( $attachment_id, '_wp_attached_file', true );
+		$target_relative = preg_replace( '/\.(jpe?g|png)$/i', '.webp', $old_relative );
+		if ( $target_relative === $old_relative ) {
+			$target_relative = '';
+		}
+
+		$now = current_time( 'mysql' );
+
+		$existing_id = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT id FROM `{$table}` WHERE attachment_id = %d LIMIT 1",
+				$attachment_id
+			)
+		);
+
+		if ( $existing_id ) {
+			$wpdb->query(
+				$wpdb->prepare(
+					"UPDATE `{$table}`
+					SET old_file = %s,
+						old_relative = %s,
+						target_relative = %s,
+						error_message = %s,
+						occurrences = occurrences + 1,
+						last_seen_at = %s
+					WHERE id = %d",
+					$old_file,
+					$old_relative,
+					$target_relative,
+					$message,
+					$now,
+					(int) $existing_id
+				)
+			);
+			return;
+		}
+
+		$wpdb->insert(
+			$table,
+			array(
+				'attachment_id'   => $attachment_id,
+				'old_file'        => $old_file,
+				'old_relative'    => $old_relative,
+				'target_relative' => $target_relative,
+				'error_message'   => $message,
+				'occurrences'     => 1,
+				'created_at'      => $now,
+				'last_seen_at'    => $now,
+			),
+			array( '%d', '%s', '%s', '%s', '%s', '%d', '%s', '%s' )
 		);
 	}
 
@@ -357,7 +662,7 @@ class OC_WebP_Media_Converter {
 			$where_args[]  = '%' . $wpdb->esc_like( $needle ) . '%';
 		}
 
-		$sql = "SELECT `{$id_column}` AS row_id, `{$value_column}` AS row_value FROM `{$table}` WHERE " . implode( ' OR ', $where_parts );
+		$sql  = "SELECT `{$id_column}` AS row_id, `{$value_column}` AS row_value FROM `{$table}` WHERE " . implode( ' OR ', $where_parts );
 		$rows = $wpdb->get_results( $wpdb->prepare( $sql, $where_args ) );
 
 		if ( empty( $rows ) ) {
@@ -503,5 +808,7 @@ class OC_WebP_Media_Converter {
 		return $found === $table;
 	}
 }
+
+register_activation_hook( __FILE__, array( 'OC_WebP_Media_Converter', 'activate' ) );
 
 new OC_WebP_Media_Converter();
