@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: OC WebP Media Converter
- * Description: Converts JPG/JPEG/PNG Media Library attachments to WebP, updates attachment records, regenerates image sizes, optionally updates database references, and optionally removes original files.
- * Version: 0.2.0
+ * Description: Converts JPG/JPEG/PNG Media Library attachments to high-quality WebP, updates attachment records, regenerates image sizes, optionally updates database references, optionally removes original files, and can convert JPG/PNG uploads to WebP automatically.
+ * Version: 0.4.1
  * Author: TriAd/ChatGPT
  * License: GPL-2.0-or-later
  */
@@ -15,17 +15,28 @@ class OC_WebP_Media_Converter {
 	const PAGE_SLUG        = 'oc-webp-media-converter';
 	const NONCE_ACTION     = 'oc_webp_media_converter_run';
 	const ERROR_NONCE      = 'oc_webp_media_converter_error_log';
+	const SETTINGS_NONCE   = 'oc_webp_media_converter_settings';
+	const SETTINGS_OPTION  = 'oc_webp_media_converter_settings';
 	const DB_VERSION       = '1.0';
 	const DB_VERSION_OPTION = 'oc_webp_media_converter_db_version';
+	const MEDIA_CONVERT_NONCE = 'ocwc_media_convert';
 
 	public function __construct() {
 		add_action( 'admin_menu', array( $this, 'add_admin_page' ) );
 		add_action( 'admin_init', array( $this, 'maybe_upgrade_db' ) );
+		add_filter( 'wp_handle_upload', array( $this, 'maybe_convert_upload_to_webp' ), 20, 2 );
+		add_filter( 'wp_editor_set_quality', array( $this, 'filter_webp_upload_quality' ), 5, 2 );
+		add_filter( 'attachment_fields_to_edit', array( $this, 'add_media_library_webp_button' ), 20, 2 );
+		
+		add_action( 'wp_ajax_ocwc_convert_media_attachment_to_webp', array( $this, 'ajax_convert_media_attachment_to_webp' ) );
+		
+		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_scripts' ) );
 	}
 
 	public static function activate() {
 		self::create_error_log_table();
 		update_option( self::DB_VERSION_OPTION, self::DB_VERSION );
+		add_option( self::SETTINGS_OPTION, self::get_default_plugin_settings() );
 	}
 
 	public function maybe_upgrade_db() {
@@ -34,7 +45,195 @@ class OC_WebP_Media_Converter {
 			update_option( self::DB_VERSION_OPTION, self::DB_VERSION );
 		}
 	}
+	
+	public function enqueue_admin_scripts( $hook_suffix ) {
+		if ( ! current_user_can( 'upload_files' ) ) {
+			return;
+		}
 
+		wp_enqueue_script('ocwc-webp-convert',plugin_dir_url( __FILE__ ) . 'webp-convert.js',array( 'jquery' ),'0.4.6',true);
+
+		wp_localize_script('ocwc-webp-convert','OCWCWebPConvert',
+			array(
+				'ajaxUrl' => admin_url( 'admin-ajax.php' ),
+				'nonce'   => wp_create_nonce( self::MEDIA_CONVERT_NONCE ),
+				'i18n'    => array(
+					'processing' => __( 'Converting...', 'oc-webp-media-converter' ),
+					'success'    => __( 'Converted successfully.', 'oc-webp-media-converter' ),
+					'error'      => __( 'Conversion failed.', 'oc-webp-media-converter' ),
+				),
+			)
+		);
+	}
+	
+	public function add_media_library_webp_button( $form_fields, $post ) {
+
+		$settings = $this->get_plugin_settings();
+
+		$default_quality   = isset( $settings['convert_quality'] ) ? absint( $settings['convert_quality'] ) : 90;
+		$default_max_width = isset( $settings['convert_max_width'] ) ? absint( $settings['convert_max_width'] ) : 0;
+
+		$default_quality   = max( 1, min( 100, $default_quality ) );
+		$default_max_width = max( 0, $default_max_width );
+
+		$form_fields['ocwc_convert_to_webp'] = array(
+			'label' => __( 'WebP Conversion', 'oc-webp-media-converter' ),
+			'input' => 'html',
+			'html'  => '
+				<div class="ocwc-media-conversion-fields" data-attachment-id="' . esc_attr( $post->ID ) . '">
+
+					<p>
+						<label for="ocwc-media-quality-' . esc_attr( $post->ID ) . '">
+							<strong>Convert Quality</strong>
+						</label><br>
+						<input
+							type="number"
+							id="ocwc-media-quality-' . esc_attr( $post->ID ) . '"
+							class="ocwc-media-quality"
+							min="1"
+							max="100"
+							value="' . esc_attr( $default_quality ) . '"
+							style="width:90px;"
+						>
+					</p>
+
+					<p>
+						<label for="ocwc-media-max-width-' . esc_attr( $post->ID ) . '">
+							<strong>Max Width</strong>
+						</label><br>
+						<input
+							type="number"
+							id="ocwc-media-max-width-' . esc_attr( $post->ID ) . '"
+							class="ocwc-media-max-width"
+							min="0"
+							value="' . esc_attr( $default_max_width ) . '"
+							style="width:90px;"
+						>
+					</p>
+
+					<p class="description">
+						Use 0 to keep the current width. Wider images are scaled proportionately.
+					</p>
+
+					<p>
+						<label>
+							<input
+								type="checkbox"
+								class="ocwc-media-update-refs"
+								value="1"
+								checked="checked"
+							>
+							Update references
+						</label>
+					</p>
+
+					<p>
+						<button
+							type="button"
+							class="button button-primary ocwc-media-convert-button"
+							data-attachment-id="' . esc_attr( $post->ID ) . '"
+						>
+							Convert to WebP
+						</button>
+						<span class="spinner ocwc-media-convert-spinner"></span>
+					</p>
+
+					<p class="ocwc-media-convert-status"></p>
+				</div>
+			',
+			'helps' => __( 'Convert this JPG/PNG image to WebP. Existing WebP images will return an error if clicked.', 'oc-webp-media-converter' ),
+		);
+
+		return $form_fields;
+	}
+	
+	public function ajax_convert_media_attachment_to_webp() {
+		if ( ! current_user_can( 'upload_files' ) ) {
+			wp_send_json_error(
+				array(
+					'message' => 'You do not have permission to convert media files.',
+				),
+				403
+			);
+		}
+
+		if ( ! check_ajax_referer( self::MEDIA_CONVERT_NONCE, 'nonce', false ) ) {
+			wp_send_json_error(
+				array(
+					'message' => 'Security check failed. Refresh the page and try again.',
+				),
+				403
+			);
+		}
+
+		$attachment_id = isset( $_POST['attachment_id'] ) ? absint( $_POST['attachment_id'] ) : 0;
+		$quality       = isset( $_POST['quality'] ) ? absint( $_POST['quality'] ) : 90;
+		$max_width     = isset( $_POST['max_width'] ) ? absint( $_POST['max_width'] ) : 0;
+		$update_refs   = ! empty( $_POST['update_refs'] ) ? 1 : 0;
+
+		$quality   = max( 1, min( 100, $quality ) );
+		$max_width = max( 0, $max_width );
+
+		if ( ! $attachment_id || 'attachment' !== get_post_type( $attachment_id ) ) {
+			wp_send_json_error(
+				array(
+					'message' => 'Invalid attachment ID.',
+				),
+				400
+			);
+		}
+
+		$mime_type = strtolower( (string) get_post_mime_type( $attachment_id ) );
+
+		if ( ! in_array( $mime_type, array( 'image/jpeg', 'image/jpg', 'image/png' ), true ) ) {
+			wp_send_json_error(
+				array(
+					'message' => 'This attachment is not a JPG or PNG image, so it cannot be converted.',
+				),
+				400
+			);
+		}
+
+		$options = $this->get_upload_conversion_options( $quality, $max_width );
+
+		// Media Library single-image conversion should always remove the old JPG/PNG files.
+		$options['delete_originals'] = 1;
+
+		// Do not create backup copies for this manual single-image conversion.
+		// Change this to 1 if you want the plugin to keep backups in wp-content/uploads/oc-webp-backup/.
+		$options['backup_originals'] = 0;
+
+		// Controlled by the checkbox in the attachment details panel.
+		$options['update_refs'] = $update_refs;
+
+		$result = $this->convert_attachment( $attachment_id, $options );
+
+		if ( empty( $result['success'] ) ) {
+			wp_send_json_error(
+				array(
+					'message' => ! empty( $result['message'] ) ? $result['message'] : 'Conversion failed.',
+				),
+				400
+			);
+		}
+
+		clean_attachment_cache( $attachment_id );
+		clean_post_cache( $attachment_id );
+
+		$new_file = get_attached_file( $attachment_id );
+		$new_url  = wp_get_attachment_url( $attachment_id );
+
+		wp_send_json_success(
+			array(
+				'message'       => ! empty( $result['message'] ) ? $result['message'] : 'Converted successfully.',
+				'attachment_id' => $attachment_id,
+				'url'           => $new_url,
+				'filename'      => $new_file ? basename( $new_file ) : '',
+				'mime_type'     => get_post_mime_type( $attachment_id ),
+			)
+		);
+	}
+	
 	public static function get_error_log_table_name() {
 		global $wpdb;
 		return $wpdb->prefix . 'oc_webp_error_log';
@@ -67,6 +266,42 @@ class OC_WebP_Media_Converter {
 		dbDelta( $sql );
 	}
 
+
+	private static function get_default_plugin_settings() {
+		return array(
+			'convert_on_upload' => 0,
+			'convert_quality'   => 90,
+			'convert_max_width' => 0,
+		);
+	}
+
+	private function get_plugin_settings() {
+		$settings = get_option( self::SETTINGS_OPTION, array() );
+		if ( ! is_array( $settings ) ) {
+			$settings = array();
+		}
+
+		$settings = wp_parse_args( $settings, self::get_default_plugin_settings() );
+
+		return array(
+			'convert_on_upload' => ! empty( $settings['convert_on_upload'] ) ? 1 : 0,
+			'convert_quality'   => max( 1, min( 100, absint( $settings['convert_quality'] ?? 90 ) ) ),
+			'convert_max_width' => max( 0, absint( $settings['convert_max_width'] ?? 0 ) ),
+		);
+	}
+
+	private function save_plugin_settings_from_post() {
+		$settings = array(
+			'convert_on_upload' => ! empty( $_POST['convert_on_upload'] ) ? 1 : 0,
+			'convert_quality'   => max( 1, min( 100, absint( $_POST['convert_quality'] ?? 90 ) ) ),
+			'convert_max_width' => max( 0, absint( $_POST['convert_max_width'] ?? 0 ) ),
+		);
+
+		update_option( self::SETTINGS_OPTION, $settings );
+
+		return $settings;
+	}
+
 	public function add_admin_page() {
 		add_management_page(
 			'OC WebP Media Converter',
@@ -91,13 +326,18 @@ class OC_WebP_Media_Converter {
 			'update_refs'      => 1,
 			'delete_originals' => 0,
 			'backup_originals' => 1,
+			'engine'           => 'auto',
+			'cwebp_path'      => 'cwebp',
+			'encoding_effort' => 6,
+			'sharp_yuv'       => 1,
+			'sharpen_after_resize' => 1,
 		);
 
 		$options     = $defaults;
 		$results     = array();
 		$notice      = '';
 		$current_tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'converter';
-		if ( ! in_array( $current_tab, array( 'converter', 'error-log' ), true ) ) {
+		if ( ! in_array( $current_tab, array( 'converter', 'error-log', 'settings' ), true ) ) {
 			$current_tab = 'converter';
 		}
 
@@ -114,8 +354,22 @@ class OC_WebP_Media_Converter {
 			$current_tab = 'error-log';
 		}
 
+
+		if ( isset( $_POST['ocwc_save_settings'] ) ) {
+			check_admin_referer( self::SETTINGS_NONCE, 'ocwc_settings_nonce' );
+
+			$this->save_plugin_settings_from_post();
+			$notice     = 'Settings saved.';
+			$current_tab = 'settings';
+		}
+
 		if ( isset( $_POST['ocwc_run_batch'] ) ) {
 			check_admin_referer( self::NONCE_ACTION, 'ocwc_nonce' );
+
+			$engine = sanitize_key( wp_unslash( $_POST['engine'] ?? $defaults['engine'] ) );
+			if ( ! in_array( $engine, array( 'auto', 'cwebp', 'imagick', 'wordpress' ), true ) ) {
+				$engine = $defaults['engine'];
+			}
 
 			$options = array(
 				'batch_size'       => max( 1, min( 25, absint( $_POST['batch_size'] ?? $defaults['batch_size'] ) ) ),
@@ -124,6 +378,11 @@ class OC_WebP_Media_Converter {
 				'update_refs'      => ! empty( $_POST['update_refs'] ) ? 1 : 0,
 				'delete_originals' => ! empty( $_POST['delete_originals'] ) ? 1 : 0,
 				'backup_originals' => ! empty( $_POST['backup_originals'] ) ? 1 : 0,
+				'engine'           => $engine,
+				'cwebp_path'      => sanitize_text_field( wp_unslash( $_POST['cwebp_path'] ?? $defaults['cwebp_path'] ) ),
+				'encoding_effort' => max( 0, min( 6, absint( $_POST['encoding_effort'] ?? $defaults['encoding_effort'] ) ) ),
+				'sharp_yuv'       => ! empty( $_POST['sharp_yuv'] ) ? 1 : 0,
+				'sharpen_after_resize' => ! empty( $_POST['sharpen_after_resize'] ) ? 1 : 0,
 			);
 
 			$results     = $this->run_batch( $options );
@@ -132,7 +391,10 @@ class OC_WebP_Media_Converter {
 
 		$remaining      = $this->get_remaining_count();
 		$error_count    = $this->get_error_log_count();
+		$plugin_settings = $this->get_plugin_settings();
 		$webp_supported = wp_image_editor_supports( array( 'mime_type' => 'image/webp' ) );
+		$imagick_available = class_exists( 'Imagick' );
+		$exec_available = function_exists( 'exec' );
 
 		?>
 		<div class="wrap">
@@ -146,6 +408,8 @@ class OC_WebP_Media_Converter {
 
 			<?php if ( 'error-log' === $current_tab ) : ?>
 				<?php $this->render_error_log_tab(); ?>
+			<?php elseif ( 'settings' === $current_tab ) : ?>
+				<?php $this->render_settings_tab( $plugin_settings ); ?>
 			<?php else : ?>
 				<?php if ( ! $webp_supported ) : ?>
 					<div class="notice notice-error"><p><strong>WebP is not supported by the current server image editor.</strong> Your GD/Imagick setup must support WebP before conversion can run.</p></div>
@@ -169,7 +433,34 @@ class OC_WebP_Media_Converter {
 						</tr>
 						<tr>
 							<th scope="row"><label for="quality">WebP quality</label></th>
-							<td><input name="quality" id="quality" type="number" min="1" max="100" value="<?php echo esc_attr( $options['quality'] ); ?>" /> <p class="description">82 is a good starting point.</p></td>
+							<td><input name="quality" id="quality" type="number" min="1" max="100" value="<?php echo esc_attr( $options['quality'] ); ?>" /> <p class="description">Different encoders do not match Photoshop quality numbers exactly. If 82 looks soft, try 90–94.</p></td>
+						</tr>
+						<tr>
+							<th scope="row"><label for="engine">Conversion engine</label></th>
+							<td>
+								<select name="engine" id="engine">
+									<option value="auto" <?php selected( $options['engine'], 'auto' ); ?>>Auto: cwebp, then Imagick, then WordPress</option>
+									<option value="cwebp" <?php selected( $options['engine'], 'cwebp' ); ?>>cwebp command-line encoder</option>
+									<option value="imagick" <?php selected( $options['engine'], 'imagick' ); ?>>PHP Imagick</option>
+									<option value="wordpress" <?php selected( $options['engine'], 'wordpress' ); ?>>WordPress image editor fallback</option>
+								</select>
+								<p class="description">For best quality, use <code>cwebp</code> if your host has it. Imagick is usually better than GD. Server status: Imagick <?php echo $imagick_available ? '<strong>available</strong>' : '<strong>not available</strong>'; ?>; exec() <?php echo $exec_available ? '<strong>available</strong>' : '<strong>not available</strong>'; ?>.</p>
+							</td>
+						</tr>
+						<tr>
+							<th scope="row"><label for="cwebp_path">cwebp path</label></th>
+							<td><input name="cwebp_path" id="cwebp_path" type="text" class="regular-text" value="<?php echo esc_attr( $options['cwebp_path'] ); ?>" /> <p class="description">Leave as <code>cwebp</code> if it is available in the server PATH, or enter the full path such as <code>/usr/bin/cwebp</code>.</p></td>
+						</tr>
+						<tr>
+							<th scope="row"><label for="encoding_effort">Encoding effort</label></th>
+							<td><input name="encoding_effort" id="encoding_effort" type="number" min="0" max="6" value="<?php echo esc_attr( $options['encoding_effort'] ); ?>" /> <p class="description">6 is slowest but best compression/quality tradeoff. Used by cwebp and Imagick when supported.</p></td>
+						</tr>
+						<tr>
+							<th scope="row">Quality options</th>
+							<td>
+								<label><input name="sharp_yuv" type="checkbox" value="1" <?php checked( $options['sharp_yuv'], 1 ); ?> /> Use sharp YUV when supported.</label><br />
+								<label><input name="sharpen_after_resize" type="checkbox" value="1" <?php checked( $options['sharpen_after_resize'], 1 ); ?> /> Apply mild sharpening after resize when using Imagick.</label>
+							</td>
 						</tr>
 						<tr>
 							<th scope="row"><label for="max_width">Maximum width</label></th>
@@ -226,11 +517,62 @@ class OC_WebP_Media_Converter {
 			),
 			admin_url( 'tools.php' )
 		);
+
+		$settings_url = add_query_arg(
+			array(
+				'page' => self::PAGE_SLUG,
+				'tab'  => 'settings',
+			),
+			admin_url( 'tools.php' )
+		);
 		?>
 		<h2 class="nav-tab-wrapper">
 			<a href="<?php echo esc_url( $converter_url ); ?>" class="nav-tab <?php echo 'converter' === $current_tab ? 'nav-tab-active' : ''; ?>">Converter</a>
 			<a href="<?php echo esc_url( $error_url ); ?>" class="nav-tab <?php echo 'error-log' === $current_tab ? 'nav-tab-active' : ''; ?>">Error Log</a>
+			<a href="<?php echo esc_url( $settings_url ); ?>" class="nav-tab <?php echo 'settings' === $current_tab ? 'nav-tab-active' : ''; ?>">Settings</a>
 		</h2>
+		<?php
+	}
+
+
+	private function render_settings_tab( $settings ) {
+		$settings = is_array( $settings ) ? wp_parse_args( $settings, self::get_default_plugin_settings() ) : self::get_default_plugin_settings();
+		?>
+		<h2>Settings</h2>
+		<p>Use these settings to automatically convert new JPG/JPEG/PNG uploads to WebP as they are added to the Media Library.</p>
+
+		<form method="post">
+			<?php wp_nonce_field( self::SETTINGS_NONCE, 'ocwc_settings_nonce' ); ?>
+
+			<table class="form-table" role="presentation">
+				<tr>
+					<th scope="row">Convert on upload</th>
+					<td>
+						<label>
+							<input name="convert_on_upload" type="checkbox" value="1" <?php checked( ! empty( $settings['convert_on_upload'] ) ); ?> />
+							Automatically convert JPG/JPEG/PNG uploads to WebP.
+						</label>
+						<p class="description">When enabled, new JPG/JPEG/PNG files are converted immediately after upload, the upload record is changed to WebP before the attachment is created, and the original uploaded JPG/PNG file is deleted after a successful conversion.</p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="convert_quality">Convert Quality</label></th>
+					<td>
+						<input name="convert_quality" id="convert_quality" type="number" min="1" max="100" value="<?php echo esc_attr( max( 1, min( 100, absint( $settings['convert_quality'] ?? 90 ) ) ) ); ?>" />
+						<p class="description">WebP quality for automatic upload conversion. Try 90–94 if lower values look soft compared with Photoshop.</p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="convert_max_width">Max Width</label></th>
+					<td>
+						<input name="convert_max_width" id="convert_max_width" type="number" min="0" value="<?php echo esc_attr( max( 0, absint( $settings['convert_max_width'] ?? 0 ) ) ); ?>" />
+						<p class="description">Use 0 to keep original dimensions. If a JPG/PNG upload is wider than this number, it will be scaled down proportionately before saving as WebP. Smaller images are converted to WebP without resizing.</p>
+					</td>
+				</tr>
+			</table>
+
+			<p><button class="button button-primary" name="ocwc_save_settings" value="1">Save Settings</button></p>
+		</form>
 		<?php
 	}
 
@@ -320,6 +662,100 @@ class OC_WebP_Media_Converter {
 			?>
 		<?php endif; ?>
 		<?php
+	}
+
+
+	public function filter_webp_upload_quality( $default_quality, $mime_type = '' ) {
+		if ( 'image/webp' !== $mime_type ) {
+			return $default_quality;
+		}
+
+		$settings = $this->get_plugin_settings();
+		if ( empty( $settings['convert_on_upload'] ) ) {
+			return $default_quality;
+		}
+
+		return max( 1, min( 100, (int) $settings['convert_quality'] ) );
+	}
+
+	public function maybe_convert_upload_to_webp( $upload, $context = '' ) {
+		$settings = $this->get_plugin_settings();
+		if ( empty( $settings['convert_on_upload'] ) ) {
+			return $upload;
+		}
+
+		if ( empty( $upload['file'] ) || empty( $upload['type'] ) ) {
+			return $upload;
+		}
+
+		$mime_type = strtolower( (string) $upload['type'] );
+		if ( ! in_array( $mime_type, array( 'image/jpeg', 'image/png' ), true ) ) {
+			return $upload;
+		}
+
+		$old_file = wp_normalize_path( $upload['file'] );
+		if ( ! file_exists( $old_file ) || ! is_readable( $old_file ) ) {
+			return $upload;
+		}
+
+		$ext = strtolower( pathinfo( $old_file, PATHINFO_EXTENSION ) );
+		if ( ! in_array( $ext, array( 'jpg', 'jpeg', 'png' ), true ) ) {
+			return $upload;
+		}
+
+		$dir             = dirname( $old_file );
+		$target_filename = preg_replace( '/\.(jpe?g|png)$/i', '.webp', basename( $old_file ) );
+		$new_file        = wp_normalize_path( trailingslashit( $dir ) . $target_filename );
+
+		if ( file_exists( $new_file ) ) {
+			$target_filename = wp_unique_filename( $dir, $target_filename );
+			$new_file        = wp_normalize_path( trailingslashit( $dir ) . $target_filename );
+		}
+
+		if ( ! function_exists( 'wp_get_image_editor' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/image.php';
+		}
+
+		$options = $this->get_upload_conversion_options( (int) $settings['convert_quality'], (int) $settings['convert_max_width'] );
+		$result  = $this->create_webp_file( $old_file, $new_file, $options );
+
+		if ( is_wp_error( $result ) ) {
+			error_log( 'OC WebP Media Converter upload conversion failed for ' . $old_file . ': ' . $result->get_error_message() );
+			return $upload;
+		}
+
+		if ( empty( $result['path'] ) || ! file_exists( $result['path'] ) ) {
+			error_log( 'OC WebP Media Converter upload conversion failed for ' . $old_file . ': WebP file was not created.' );
+			return $upload;
+		}
+
+		@unlink( $old_file );
+		if ( file_exists( $old_file ) ) {
+			error_log( 'OC WebP Media Converter could not delete original uploaded file after WebP conversion: ' . $old_file );
+		}
+
+		$new_url = $this->absolute_upload_file_to_url( $new_file );
+		if ( empty( $new_url ) && ! empty( $upload['url'] ) ) {
+			$new_url = preg_replace( '/\.(jpe?g|png)$/i', '.webp', $upload['url'] );
+		}
+
+		$upload['file'] = $new_file;
+		$upload['url']  = $new_url;
+		$upload['type'] = 'image/webp';
+
+		return $upload;
+	}
+
+	private function get_upload_conversion_options( $quality, $max_width ) {
+		return array(
+			'quality'              => max( 1, min( 100, (int) $quality ) ),
+			'max_width'            => max( 0, (int) $max_width ),
+			'engine'               => 'auto',
+			'cwebp_path'           => 'cwebp',
+			'encoding_effort'      => 6,
+			'sharp_yuv'            => 1,
+			'sharpen_after_resize' => 1,
+		);
 	}
 
 	private function get_remaining_count() {
@@ -469,30 +905,12 @@ class OC_WebP_Media_Converter {
 
 		$old_meta = wp_get_attachment_metadata( $attachment_id );
 
-		$editor = wp_get_image_editor( $old_file );
-		if ( is_wp_error( $editor ) ) {
-			return $this->result( $attachment_id, false, 'Image editor error: ' . $editor->get_error_message() );
+		$conversion_result = $this->create_webp_file( $old_file, $new_file, $options );
+		if ( is_wp_error( $conversion_result ) ) {
+			return $this->result( $attachment_id, false, $conversion_result->get_error_message() );
 		}
 
-		$editor->set_quality( (int) $options['quality'] );
-
-		$max_width = (int) $options['max_width'];
-		if ( $max_width > 0 ) {
-			$size = $editor->get_size();
-			if ( ! empty( $size['width'] ) && (int) $size['width'] > $max_width ) {
-				$resized = $editor->resize( $max_width, null, false );
-				if ( is_wp_error( $resized ) ) {
-					return $this->result( $attachment_id, false, 'Resize error: ' . $resized->get_error_message() );
-				}
-			}
-		}
-
-		$saved = $editor->save( $new_file, 'image/webp' );
-		if ( is_wp_error( $saved ) ) {
-			return $this->result( $attachment_id, false, 'WebP save error: ' . $saved->get_error_message() );
-		}
-
-		if ( empty( $saved['path'] ) || ! file_exists( $saved['path'] ) ) {
+		if ( empty( $conversion_result['path'] ) || ! file_exists( $conversion_result['path'] ) ) {
 			return $this->result( $attachment_id, false, 'WebP file was not created.' );
 		}
 
@@ -506,7 +924,7 @@ class OC_WebP_Media_Converter {
 			)
 		);
 
-		$new_meta = wp_generate_attachment_metadata( $attachment_id, $new_file );
+		$new_meta = $this->generate_attachment_metadata_with_quality( $attachment_id, $new_file, (int) $options['quality'] );
 		if ( is_array( $new_meta ) && ! empty( $new_meta ) ) {
 			wp_update_attachment_metadata( $attachment_id, $new_meta );
 		}
@@ -521,9 +939,262 @@ class OC_WebP_Media_Converter {
 			$deleted_count = $this->delete_old_files( $old_file, $old_meta, ! empty( $options['backup_originals'] ) );
 		}
 
-		$message = 'Converted to ' . basename( $new_file ) . '. DB rows updated: ' . (int) $replacement_count . '. Old files deleted: ' . (int) $deleted_count . '.';
+		$message = 'Converted to ' . basename( $new_file ) . ' using ' . $conversion_result['engine'] . '. DB rows updated: ' . (int) $replacement_count . '. Old files deleted: ' . (int) $deleted_count . '.';
 
 		return $this->result( $attachment_id, true, $message );
+	}
+
+	private function create_webp_file( $old_file, $new_file, $options ) {
+		$engines = $this->get_conversion_engine_order( $options['engine'] ?? 'auto' );
+		$errors  = array();
+
+		foreach ( $engines as $engine ) {
+			if ( 'cwebp' === $engine ) {
+				$result = $this->convert_with_cwebp( $old_file, $new_file, $options );
+			} elseif ( 'imagick' === $engine ) {
+				$result = $this->convert_with_imagick( $old_file, $new_file, $options );
+			} else {
+				$result = $this->convert_with_wordpress_editor( $old_file, $new_file, $options );
+			}
+
+			if ( ! is_wp_error( $result ) ) {
+				return $result;
+			}
+
+			$errors[] = $engine . ': ' . $result->get_error_message();
+		}
+
+		return new WP_Error( 'ocwc_conversion_failed', 'Could not create high-quality WebP. Tried ' . implode( ' | ', $errors ) );
+	}
+
+	private function get_conversion_engine_order( $engine ) {
+		if ( 'cwebp' === $engine ) {
+			return array( 'cwebp' );
+		}
+		if ( 'imagick' === $engine ) {
+			return array( 'imagick' );
+		}
+		if ( 'wordpress' === $engine ) {
+			return array( 'wordpress' );
+		}
+
+		return array( 'cwebp', 'imagick', 'wordpress' );
+	}
+
+	private function convert_with_cwebp( $old_file, $new_file, $options ) {
+		if ( ! function_exists( 'exec' ) ) {
+			return new WP_Error( 'ocwc_no_exec', 'exec() is disabled, so cwebp cannot be used.' );
+		}
+
+		$binary = trim( (string) ( $options['cwebp_path'] ?? 'cwebp' ) );
+		if ( '' === $binary ) {
+			return new WP_Error( 'ocwc_no_cwebp_path', 'No cwebp path was provided.' );
+		}
+
+		$version_output = array();
+		$version_code   = 0;
+		@exec( escapeshellarg( $binary ) . ' -version 2>&1', $version_output, $version_code );
+		if ( 0 !== (int) $version_code ) {
+			return new WP_Error( 'ocwc_cwebp_missing', 'cwebp is not available at: ' . $binary );
+		}
+
+		$quality = max( 1, min( 100, (int) ( $options['quality'] ?? 82 ) ) );
+		$effort  = max( 0, min( 6, (int) ( $options['encoding_effort'] ?? 6 ) ) );
+
+		$parts = array(
+			escapeshellarg( $binary ),
+			'-quiet',
+			'-q',
+			(string) $quality,
+			'-m',
+			(string) $effort,
+		);
+
+		if ( ! empty( $options['sharp_yuv'] ) ) {
+			$parts[] = '-sharp_yuv';
+		}
+
+		$max_width = (int) ( $options['max_width'] ?? 0 );
+		if ( $max_width > 0 ) {
+			$dimensions = $this->get_image_dimensions( $old_file );
+			if ( ! empty( $dimensions['width'] ) && (int) $dimensions['width'] > $max_width ) {
+				$parts[] = '-resize';
+				$parts[] = (string) $max_width;
+				$parts[] = '0';
+			}
+		}
+
+		$parts[] = escapeshellarg( $old_file );
+		$parts[] = '-o';
+		$parts[] = escapeshellarg( $new_file );
+
+		$output = array();
+		$code   = 0;
+		@exec( implode( ' ', $parts ) . ' 2>&1', $output, $code );
+
+		if ( 0 !== (int) $code ) {
+			$message = ! empty( $output ) ? implode( ' ', array_slice( $output, -3 ) ) : 'Unknown cwebp error.';
+			return new WP_Error( 'ocwc_cwebp_failed', 'cwebp failed: ' . $message );
+		}
+
+		if ( ! file_exists( $new_file ) ) {
+			return new WP_Error( 'ocwc_cwebp_missing_output', 'cwebp finished but did not create the output file.' );
+		}
+
+		return array(
+			'path'   => $new_file,
+			'engine' => 'cwebp',
+		);
+	}
+
+	private function convert_with_imagick( $old_file, $new_file, $options ) {
+		if ( ! class_exists( 'Imagick' ) ) {
+			return new WP_Error( 'ocwc_no_imagick', 'Imagick is not available on this server.' );
+		}
+
+		try {
+			$image = new Imagick( $old_file );
+
+			if ( method_exists( $image, 'autoOrientImage' ) ) {
+				$image->autoOrientImage();
+			}
+
+			if ( defined( 'Imagick::COLORSPACE_SRGB' ) && method_exists( $image, 'getImageColorspace' ) && method_exists( $image, 'transformImageColorspace' ) ) {
+				$colorspace = $image->getImageColorspace();
+				if ( $colorspace && Imagick::COLORSPACE_SRGB !== $colorspace ) {
+					$image->transformImageColorspace( Imagick::COLORSPACE_SRGB );
+				}
+			}
+
+			$resized   = false;
+			$max_width = (int) ( $options['max_width'] ?? 0 );
+			if ( $max_width > 0 ) {
+				$geometry = $image->getImageGeometry();
+				if ( ! empty( $geometry['width'] ) && (int) $geometry['width'] > $max_width ) {
+					$target = $this->get_resized_dimensions( (int) $geometry['width'], (int) $geometry['height'], $max_width );
+					$filter = defined( 'Imagick::FILTER_LANCZOS' ) ? Imagick::FILTER_LANCZOS : Imagick::FILTER_TRIANGLE;
+					$image->resizeImage( $target['width'], $target['height'], $filter, 1 );
+					$resized = true;
+				}
+			}
+
+			if ( $resized && ! empty( $options['sharpen_after_resize'] ) && method_exists( $image, 'unsharpMaskImage' ) ) {
+				$image->unsharpMaskImage( 0.5, 0.5, 0.35, 0.02 );
+			}
+
+			$quality = max( 1, min( 100, (int) ( $options['quality'] ?? 82 ) ) );
+			$effort  = max( 0, min( 6, (int) ( $options['encoding_effort'] ?? 6 ) ) );
+
+			$image->setImageFormat( 'webp' );
+			if ( defined( 'Imagick::COMPRESSION_WEBP' ) ) {
+				$image->setImageCompression( Imagick::COMPRESSION_WEBP );
+			}
+			$image->setImageCompressionQuality( $quality );
+			$image->setOption( 'webp:method', (string) $effort );
+			if ( ! empty( $options['sharp_yuv'] ) ) {
+				$image->setOption( 'webp:use-sharp-yuv', 'true' );
+			}
+			$image->setOption( 'webp:alpha-quality', '100' );
+
+			if ( method_exists( $image, 'stripImage' ) ) {
+				$image->stripImage();
+			}
+
+			if ( ! $image->writeImage( $new_file ) ) {
+				$image->clear();
+				$image->destroy();
+				return new WP_Error( 'ocwc_imagick_write_failed', 'Imagick could not write the WebP file.' );
+			}
+
+			$image->clear();
+			$image->destroy();
+		} catch ( Exception $e ) {
+			return new WP_Error( 'ocwc_imagick_exception', 'Imagick error: ' . $e->getMessage() );
+		}
+
+		return array(
+			'path'   => $new_file,
+			'engine' => 'Imagick high-quality',
+		);
+	}
+
+	private function convert_with_wordpress_editor( $old_file, $new_file, $options ) {
+		$editor = wp_get_image_editor( $old_file );
+		if ( is_wp_error( $editor ) ) {
+			return new WP_Error( 'ocwc_wp_editor_error', 'Image editor error: ' . $editor->get_error_message() );
+		}
+
+		$editor->set_quality( (int) $options['quality'] );
+
+		$max_width = (int) ( $options['max_width'] ?? 0 );
+		if ( $max_width > 0 ) {
+			$size = $editor->get_size();
+			if ( ! empty( $size['width'] ) && (int) $size['width'] > $max_width ) {
+				$resized = $editor->resize( $max_width, null, false );
+				if ( is_wp_error( $resized ) ) {
+					return new WP_Error( 'ocwc_wp_resize_error', 'Resize error: ' . $resized->get_error_message() );
+				}
+			}
+		}
+
+		$saved = $editor->save( $new_file, 'image/webp' );
+		if ( is_wp_error( $saved ) ) {
+			return new WP_Error( 'ocwc_wp_save_error', 'WebP save error: ' . $saved->get_error_message() );
+		}
+
+		return array(
+			'path'   => $saved['path'] ?? $new_file,
+			'engine' => 'WordPress image editor',
+		);
+	}
+
+	private function generate_attachment_metadata_with_quality( $attachment_id, $file, $quality ) {
+		$quality = max( 1, min( 100, (int) $quality ) );
+
+		$quality_filter = function( $default_quality, $mime_type = '' ) use ( $quality ) {
+			if ( 'image/webp' === $mime_type ) {
+				return $quality;
+			}
+			return $default_quality;
+		};
+
+		add_filter( 'wp_editor_set_quality', $quality_filter, 10, 2 );
+		$new_meta = wp_generate_attachment_metadata( $attachment_id, $file );
+		remove_filter( 'wp_editor_set_quality', $quality_filter, 10 );
+
+		return $new_meta;
+	}
+
+	private function get_image_dimensions( $file ) {
+		$size = @getimagesize( $file );
+		if ( empty( $size[0] ) || empty( $size[1] ) ) {
+			return array();
+		}
+
+		return array(
+			'width'  => (int) $size[0],
+			'height' => (int) $size[1],
+		);
+	}
+
+	private function get_resized_dimensions( $width, $height, $max_width ) {
+		$width     = max( 1, (int) $width );
+		$height    = max( 1, (int) $height );
+		$max_width = max( 1, (int) $max_width );
+
+		if ( $width <= $max_width ) {
+			return array(
+				'width'  => $width,
+				'height' => $height,
+			);
+		}
+
+		$new_height = (int) round( $height * ( $max_width / $width ) );
+
+		return array(
+			'width'  => $max_width,
+			'height' => max( 1, $new_height ),
+		);
 	}
 
 	private function result( $id, $success, $message ) {
@@ -795,6 +1466,16 @@ class OC_WebP_Media_Converter {
 		}
 
 		return ltrim( str_replace( $basedir, '', $file ), '/' );
+	}
+
+
+	private function absolute_upload_file_to_url( $file ) {
+		$relative = $this->absolute_to_upload_relative( $file );
+		if ( empty( $relative ) ) {
+			return '';
+		}
+
+		return $this->relative_upload_to_url( $relative );
 	}
 
 	private function relative_upload_to_url( $relative ) {
