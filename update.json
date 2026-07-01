@@ -1,8 +1,8 @@
 {
   "name": "OC WebP Media Converter",
   "slug": "oc-webp-media-converter",
-  "version": "0.4.7",
-  "download_url": "https://updates.triad-inc.com/oc-webp-media-converter/oc-webp-media-converter-0.4.7.zip",
+  "version": "0.5.0",
+  "download_url": "https://updates.triad-inc.com/oc-webp-media-converter/oc-webp-media-converter-0.4.8.zip",
   "homepage": "https://triad-inc.com/",
   "requires": "6.0",
   "tested": "6.6",
@@ -10,6 +10,6 @@
   "last_updated": "2026-07-01 12:30:00",
   "sections": {
     "description": "Converts JPG/JPEG/PNG Media Library attachments to high-quality WebP, supports upload conversion, manual Media Library conversion, resizing, and optional reference updates.",
-    "changelog": "<h4>0.4.7</h4><ul><li>Added auto update code.</li></ul><h4>0.4.6</h4><ul><li>Added self-hosted plugin update support.</li></ul>"
+    "changelog": "<h4>0.5.0</h4><ul><li>Added background cron batch.</li></ul><h4>0.4.7</h4><ul><li>Added auto update code.</li></ul><h4>0.4.6</h4><ul><li>Added self-hosted plugin update support.</li></ul>"
   }
 }

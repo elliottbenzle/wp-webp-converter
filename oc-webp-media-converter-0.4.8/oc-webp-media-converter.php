@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: OC WebP Media Converter
- * Description: Converts JPG/JPEG/PNG Media Library attachments and resizes oversized WebP attachments to high-quality WebP, updates attachment records, regenerates image sizes, optionally updates database references, optionally removes original files, and can convert JPG/PNG uploads to WebP automatically.
- * Version: 0.5.0
+ * Description: Converts JPG/JPEG/PNG Media Library attachments to high-quality WebP, updates attachment records, regenerates image sizes, optionally updates database references, optionally removes original files, and can convert JPG/PNG uploads to WebP automatically.
+ * Version: 0.4.8
  * Author: TriAd/ChatGPT
  * License: GPL-2.0-or-later
  * Update URI: https://updates.triad-inc.com/oc-webp-media-converter/
@@ -21,14 +21,10 @@ class OC_WebP_Media_Converter {
 	const DB_VERSION       = '1.0';
 	const DB_VERSION_OPTION = 'oc_webp_media_converter_db_version';
 	const MEDIA_CONVERT_NONCE = 'ocwc_media_convert';
-	const PLUGIN_VERSION       = '0.5.0';
+	const PLUGIN_VERSION       = '0.4.8';
 	const UPDATE_SLUG          = 'oc-webp-media-converter';
 	const UPDATE_MANIFEST_URL  = 'https://updates.triad-inc.com/oc-webp-media-converter/update.json';
 	const UPDATE_CACHE_KEY     = 'oc_webp_media_converter_update_manifest';
-	const BACKGROUND_BATCH_NONCE = 'oc_webp_media_converter_background_batch';
-	const BACKGROUND_BATCH_OPTION = 'oc_webp_media_converter_background_batch';
-	const BACKGROUND_BATCH_CRON_HOOK = 'oc_webp_media_converter_background_batch_cron';
-	const BACKGROUND_BATCH_LOCK = 'oc_webp_media_converter_background_batch_lock';
 
 	public function __construct() {
 		add_action( 'admin_menu', array( $this, 'add_admin_page' ) );
@@ -44,19 +40,12 @@ class OC_WebP_Media_Converter {
 		add_action( 'upgrader_process_complete', array( $this, 'clear_update_manifest_cache_after_update' ), 10, 2 );
 		
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_scripts' ) );
-		add_filter( 'cron_schedules', array( $this, 'add_background_batch_cron_schedule' ) );
-		add_action( self::BACKGROUND_BATCH_CRON_HOOK, array( $this, 'run_background_batch_cron' ) );
 	}
 
 	public static function activate() {
 		self::create_error_log_table();
 		update_option( self::DB_VERSION_OPTION, self::DB_VERSION );
 		add_option( self::SETTINGS_OPTION, self::get_default_plugin_settings() );
-	}
-
-	public static function deactivate() {
-		self::clear_background_batch_schedule_static();
-		delete_transient( self::BACKGROUND_BATCH_LOCK );
 	}
 
 	public function maybe_upgrade_db() {
@@ -361,10 +350,10 @@ class OC_WebP_Media_Converter {
 
 		$mime_type = strtolower( (string) get_post_mime_type( $attachment_id ) );
 
-		if ( ! in_array( $mime_type, array( 'image/jpeg', 'image/jpg', 'image/png', 'image/webp' ), true ) ) {
+		if ( ! in_array( $mime_type, array( 'image/jpeg', 'image/jpg', 'image/png' ), true ) ) {
 			wp_send_json_error(
 				array(
-					'message' => 'This attachment is not a JPG, PNG, or WebP image, so it cannot be processed.',
+					'message' => 'This attachment is not a JPG or PNG image, so it cannot be converted.',
 				),
 				400
 			);
@@ -514,7 +503,7 @@ class OC_WebP_Media_Converter {
 		$results     = array();
 		$notice      = '';
 		$current_tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'converter';
-		if ( ! in_array( $current_tab, array( 'converter', 'error-log', 'settings', 'background-batch' ), true ) ) {
+		if ( ! in_array( $current_tab, array( 'converter', 'error-log', 'settings' ), true ) ) {
 			$current_tab = 'converter';
 		}
 
@@ -538,29 +527,6 @@ class OC_WebP_Media_Converter {
 			$this->save_plugin_settings_from_post();
 			$notice     = 'Settings saved.';
 			$current_tab = 'settings';
-		}
-
-		if ( isset( $_POST['ocwc_start_background_batch'] ) ) {
-			check_admin_referer( self::BACKGROUND_BATCH_NONCE, 'ocwc_background_batch_nonce' );
-
-			$background_options = $this->save_background_batch_settings_from_post( 'running' );
-			$this->schedule_background_batch();
-			$notice     = 'Background batch started. WordPress cron will process the selected batch every 5 minutes until no processable images remain.';
-			$current_tab = 'background-batch';
-		}
-
-		if ( isset( $_POST['ocwc_stop_background_batch'] ) ) {
-			check_admin_referer( self::BACKGROUND_BATCH_NONCE, 'ocwc_background_batch_nonce' );
-
-			$background_options = $this->get_background_batch_settings();
-			$background_options['status']       = 'stopped';
-			$background_options['last_message'] = 'Background batch was stopped manually.';
-			$background_options['last_run_at']  = current_time( 'mysql' );
-			update_option( self::BACKGROUND_BATCH_OPTION, $background_options, false );
-			self::clear_background_batch_schedule_static();
-			delete_transient( self::BACKGROUND_BATCH_LOCK );
-			$notice     = 'Background batch stopped.';
-			$current_tab = 'background-batch';
 		}
 
 		if ( isset( $_POST['ocwc_run_batch'] ) ) {
@@ -600,14 +566,13 @@ class OC_WebP_Media_Converter {
 			$selected_batch_filter = 'all';
 		}
 
-		$remaining            = $this->get_remaining_count( $selected_batch_filter, $options['max_width'] );
+		$remaining            = $this->get_remaining_count( $selected_batch_filter );
 		$batch_filter_options = $this->get_batch_filter_options();
 		if ( 'all' !== $selected_batch_filter && ! isset( $batch_filter_options[ $selected_batch_filter ] ) ) {
 			$batch_filter_options[ $selected_batch_filter ] = $this->get_batch_filter_label( $selected_batch_filter );
 		}
 		$error_count          = $this->get_error_log_count();
 		$plugin_settings      = $this->get_plugin_settings();
-		$background_batch     = $this->get_background_batch_settings();
 		$webp_supported = wp_image_editor_supports( array( 'mime_type' => 'image/webp' ) );
 		$imagick_available = class_exists( 'Imagick' );
 		$exec_available = function_exists( 'exec' );
@@ -626,8 +591,6 @@ class OC_WebP_Media_Converter {
 				<?php $this->render_error_log_tab(); ?>
 			<?php elseif ( 'settings' === $current_tab ) : ?>
 				<?php $this->render_settings_tab( $plugin_settings ); ?>
-			<?php elseif ( 'background-batch' === $current_tab ) : ?>
-				<?php $this->render_background_batch_tab( $background_batch, $batch_filter_options, $webp_supported ); ?>
 			<?php else : ?>
 				<?php if ( ! $webp_supported ) : ?>
 					<div class="notice notice-error"><p><strong>WebP is not supported by the current server image editor.</strong> Your GD/Imagick setup must support WebP before conversion can run.</p></div>
@@ -638,17 +601,13 @@ class OC_WebP_Media_Converter {
 					<p>Run a small batch first, confirm the site still looks correct, then continue.</p>
 				</div>
 
-				<p><strong>Remaining processable JPG/PNG/WebP attachments:</strong> <?php echo esc_html( number_format_i18n( $remaining ) ); ?></p>
+				<p><strong>Remaining processable JPG/PNG attachments:</strong> <?php echo esc_html( number_format_i18n( $remaining ) ); ?></p>
 				<p><strong>Attachments currently skipped because they are in the error log:</strong> <?php echo esc_html( number_format_i18n( $error_count ) ); ?>. Delete an error entry from the Error Log tab if you want that attachment to be attempted again.</p>
 
 				<form method="post">
 					<?php wp_nonce_field( self::NONCE_ACTION, 'ocwc_nonce' ); ?>
 
 					<table class="form-table" role="presentation">
-						<tr>
-							<td colspan="2">
-							<p><button class="button button-primary" name="ocwc_run_batch" value="1" <?php disabled( ! $webp_supported ); ?>>Run Next Batch</button></p></td>
-						</tr>
 						<tr>
 							<th scope="row"><label for="batch_filter">Batch Filter</label></th>
 							<td>
@@ -698,7 +657,7 @@ class OC_WebP_Media_Converter {
 						</tr>
 						<tr>
 							<th scope="row"><label for="max_width">Maximum width</label></th>
-							<td><input name="max_width" id="max_width" type="number" min="0" value="<?php echo esc_attr( $options['max_width'] ); ?>" /> <p class="description">Use 0 to keep original dimensions. Example: 1800 resizes only images wider than 1800px. Existing WebP images are included in the batch only when this value is above 0 and the WebP is wider than the selected width.</p></td>
+							<td><input name="max_width" id="max_width" type="number" min="0" value="<?php echo esc_attr( $options['max_width'] ); ?>" /> <p class="description">Use 0 to keep original dimensions. Example: 1800 resizes only images wider than 1800px.</p></td>
 						</tr>
 						<tr>
 							<th scope="row">Database references</th>
@@ -719,12 +678,11 @@ class OC_WebP_Media_Converter {
 				<?php if ( ! empty( $results ) ) : ?>
 					<h2>Batch Results</h2>
 					<table class="widefat striped">
-						<thead><tr><th>Attachment ID</th><th>Originally Uploaded</th><th>Status</th><th>Message</th></tr></thead>
+						<thead><tr><th>Attachment ID</th><th>Status</th><th>Message</th></tr></thead>
 						<tbody>
 						<?php foreach ( $results as $result ) : ?>
 							<tr>
 								<td><?php echo esc_html( $result['id'] ); ?></td>
-								<td><?php echo ! empty( $result['uploaded_month_year'] ) ? esc_html( $result['uploaded_month_year'] ) : '&mdash;'; ?></td>
 								<td><?php echo $result['success'] ? '<span style="color:green;">Converted</span>' : '<span style="color:#b32d2e;">Skipped/Error</span>'; ?></td>
 								<td><?php echo esc_html( $result['message'] ); ?></td>
 							</tr>
@@ -736,21 +694,7 @@ class OC_WebP_Media_Converter {
 		</div>
 		<?php
 	}
-	
-	private function get_attachment_uploaded_month_year( $attachment_id ) {
-		if ( ! is_numeric( $attachment_id ) || (int) $attachment_id <= 0 ) {
-			return '';
-		}
 
-		$post_date = get_post_field( 'post_date', (int) $attachment_id );
-
-		if ( empty( $post_date ) ) {
-			return '';
-		}
-
-		return mysql2date( 'F Y', $post_date );
-	}
-	
 	private function render_tabs( $current_tab ) {
 		$converter_url = add_query_arg(
 			array(
@@ -774,20 +718,11 @@ class OC_WebP_Media_Converter {
 			),
 			admin_url( 'tools.php' )
 		);
-
-		$background_url = add_query_arg(
-			array(
-				'page' => self::PAGE_SLUG,
-				'tab'  => 'background-batch',
-			),
-			admin_url( 'tools.php' )
-		);
 		?>
 		<h2 class="nav-tab-wrapper">
 			<a href="<?php echo esc_url( $converter_url ); ?>" class="nav-tab <?php echo 'converter' === $current_tab ? 'nav-tab-active' : ''; ?>">Converter</a>
 			<a href="<?php echo esc_url( $error_url ); ?>" class="nav-tab <?php echo 'error-log' === $current_tab ? 'nav-tab-active' : ''; ?>">Error Log</a>
 			<a href="<?php echo esc_url( $settings_url ); ?>" class="nav-tab <?php echo 'settings' === $current_tab ? 'nav-tab-active' : ''; ?>">Settings</a>
-			<a href="<?php echo esc_url( $background_url ); ?>" class="nav-tab <?php echo 'background-batch' === $current_tab ? 'nav-tab-active' : ''; ?>">Background Batch</a>
 		</h2>
 		<?php
 	}
@@ -831,105 +766,6 @@ class OC_WebP_Media_Converter {
 
 			<p><button class="button button-primary" name="ocwc_save_settings" value="1">Save Settings</button></p>
 		</form>
-		<?php
-	}
-
-
-	private function render_background_batch_tab( $settings, $batch_filter_options, $webp_supported ) {
-		$settings = is_array( $settings ) ? wp_parse_args( $settings, self::get_default_background_batch_settings() ) : self::get_default_background_batch_settings();
-
-		$selected_filter = $this->sanitize_batch_filter_value( $settings['batch_filter'] ?? 'all' );
-		if ( 'all' !== $selected_filter && ! isset( $batch_filter_options[ $selected_filter ] ) ) {
-			$batch_filter_options[ $selected_filter ] = $this->get_batch_filter_label( $selected_filter );
-		}
-
-		$remaining       = $this->get_remaining_count( $selected_filter, (int) ( $settings['max_width'] ?? 0 ) );
-		$next_run        = wp_next_scheduled( self::BACKGROUND_BATCH_CRON_HOOK );
-		$status          = ! empty( $settings['status'] ) ? (string) $settings['status'] : 'idle';
-		$processed_count = isset( $settings['processed_count'] ) ? (int) $settings['processed_count'] : 0;
-		?>
-		<h2>Background Batch</h2>
-		<p>Start a background batch to process images automatically every 5 minutes. Each cron run uses the same conversion logic as the manual <strong>Run Next Batch</strong> button, but limits the batch size to 10 images per run.</p>
-
-		<?php if ( ! $webp_supported ) : ?>
-			<div class="notice notice-error"><p><strong>WebP is not supported by the current server image editor.</strong> Background conversion cannot run until the server image editor supports WebP output.</p></div>
-		<?php endif; ?>
-
-		<table class="widefat striped" style="max-width:900px;margin-bottom:20px;">
-			<tbody>
-				<tr><th style="width:220px;">Status</th><td><?php echo esc_html( ucfirst( str_replace( '-', ' ', $status ) ) ); ?></td></tr>
-				<tr><th>Remaining processable images</th><td><?php echo esc_html( number_format_i18n( $remaining ) ); ?></td></tr>
-				<tr><th>Total processed by this background batch</th><td><?php echo esc_html( number_format_i18n( $processed_count ) ); ?></td></tr>
-				<tr><th>Last run</th><td><?php echo ! empty( $settings['last_run_at'] ) ? esc_html( $settings['last_run_at'] ) : '&mdash;'; ?></td></tr>
-				<tr><th>Next scheduled run</th><td><?php echo $next_run ? esc_html( date_i18n( 'F j, Y g:i a', $next_run ) ) : '&mdash;'; ?></td></tr>
-				<tr><th>Last message</th><td><?php echo ! empty( $settings['last_message'] ) ? esc_html( $settings['last_message'] ) : '&mdash;'; ?></td></tr>
-			</tbody>
-		</table>
-
-		<form method="post">
-			<?php wp_nonce_field( self::BACKGROUND_BATCH_NONCE, 'ocwc_background_batch_nonce' ); ?>
-
-			<table class="form-table" role="presentation">
-				<tr>
-					<th scope="row"><label for="background_batch_filter">Batch Filter</label></th>
-					<td>
-						<select name="background_batch_filter" id="background_batch_filter">
-							<option value="all" <?php selected( $selected_filter, 'all' ); ?>>All</option>
-							<?php foreach ( $batch_filter_options as $filter_value => $filter_label ) : ?>
-								<option value="<?php echo esc_attr( $filter_value ); ?>" <?php selected( $selected_filter, $filter_value ); ?>><?php echo esc_html( $filter_label ); ?></option>
-							<?php endforeach; ?>
-						</select>
-						<p class="description">Choose All to process every remaining image, or choose a month to process only images uploaded during that month.</p>
-					</td>
-				</tr>
-				<tr>
-					<th scope="row"><label for="background_batch_size">Batch size</label></th>
-					<td><input name="background_batch_size" id="background_batch_size" type="number" min="1" max="10" value="<?php echo esc_attr( max( 1, min( 10, absint( $settings['batch_size'] ?? 5 ) ) ) ); ?>" /> <p class="description">Maximum 10 images per cron run.</p></td>
-				</tr>
-				<tr>
-					<th scope="row"><label for="background_quality">WebP quality</label></th>
-					<td><input name="background_quality" id="background_quality" type="number" min="1" max="100" value="<?php echo esc_attr( max( 1, min( 100, absint( $settings['quality'] ?? 90 ) ) ) ); ?>" /></td>
-				</tr>
-				<tr>
-					<th scope="row"><label for="background_max_width">Maximum width</label></th>
-					<td><input name="background_max_width" id="background_max_width" type="number" min="0" value="<?php echo esc_attr( max( 0, absint( $settings['max_width'] ?? 0 ) ) ); ?>" /> <p class="description">Use 0 to keep original dimensions. Existing WebP images are included only when this value is above 0 and the WebP is wider than the selected width.</p></td>
-				</tr>
-				<tr>
-					<th scope="row">Database references</th>
-					<td><label><input name="background_update_refs" type="checkbox" value="1" <?php checked( ! empty( $settings['update_refs'] ) ); ?> /> Replace JPG/PNG URLs and upload paths in posts, postmeta, options, termmeta, usermeta, and commentmeta.</label></td>
-				</tr>
-				<tr>
-					<th scope="row">Original files</th>
-					<td>
-						<label><input name="background_backup_originals" type="checkbox" value="1" <?php checked( ! empty( $settings['backup_originals'] ) ); ?> /> Back up originals before deletion to <code>wp-content/uploads/oc-webp-backup/</code>.</label><br />
-						<label><input name="background_delete_originals" type="checkbox" value="1" <?php checked( ! empty( $settings['delete_originals'] ) ); ?> /> Delete original JPG/PNG files and their old generated sizes after conversion.</label>
-					</td>
-				</tr>
-			</table>
-
-			<p>
-				<button class="button button-primary" name="ocwc_start_background_batch" value="1" <?php disabled( ! $webp_supported ); ?>>Start Batch</button>
-				<?php if ( 'running' === $status || $next_run ) : ?>
-					<button class="button" name="ocwc_stop_background_batch" value="1">Stop Background Batch</button>
-				<?php endif; ?>
-			</p>
-		</form>
-		<?php if ( ! empty( $settings['last_results'] ) && is_array( $settings['last_results'] ) ) : ?>
-			<h3>Last Cron Run Results</h3>
-			<table class="widefat striped">
-				<thead><tr><th>Attachment ID</th><th>Originally Uploaded</th><th>Status</th><th>Message</th></tr></thead>
-				<tbody>
-				<?php foreach ( $settings['last_results'] as $result ) : ?>
-					<tr>
-						<td><?php echo esc_html( $result['id'] ?? '' ); ?></td>
-						<td><?php echo ! empty( $result['uploaded_month_year'] ) ? esc_html( $result['uploaded_month_year'] ) : '&mdash;'; ?></td>
-						<td><?php echo ! empty( $result['success'] ) ? '<span style="color:green;">Converted</span>' : '<span style="color:#b32d2e;">Skipped/Error</span>'; ?></td>
-						<td><?php echo esc_html( $result['message'] ?? '' ); ?></td>
-					</tr>
-				<?php endforeach; ?>
-				</tbody>
-			</table>
-		<?php endif; ?>
 		<?php
 	}
 
@@ -1122,7 +958,7 @@ class OC_WebP_Media_Converter {
 			FROM {$wpdb->posts}
 			WHERE post_type = 'attachment'
 			AND post_status = 'inherit'
-			AND post_mime_type IN ('image/jpeg', 'image/png', 'image/webp')
+			AND post_mime_type IN ('image/jpeg', 'image/png')
 			ORDER BY upload_year DESC, upload_month DESC";
 
 		$rows    = (array) $wpdb->get_results( $sql );
@@ -1186,209 +1022,7 @@ class OC_WebP_Media_Converter {
 		);
 	}
 
-
-	public function add_background_batch_cron_schedule( $schedules ) {
-		if ( ! isset( $schedules['ocwc_every_five_minutes'] ) ) {
-			$schedules['ocwc_every_five_minutes'] = array(
-				'interval' => 5 * MINUTE_IN_SECONDS,
-				'display'  => __( 'Every 5 minutes', 'oc-webp-media-converter' ),
-			);
-		}
-
-		return $schedules;
-	}
-
-	private static function clear_background_batch_schedule_static() {
-		$timestamp = wp_next_scheduled( self::BACKGROUND_BATCH_CRON_HOOK );
-		while ( $timestamp ) {
-			wp_unschedule_event( $timestamp, self::BACKGROUND_BATCH_CRON_HOOK );
-			$timestamp = wp_next_scheduled( self::BACKGROUND_BATCH_CRON_HOOK );
-		}
-	}
-
-	private function schedule_background_batch() {
-		self::clear_background_batch_schedule_static();
-		wp_schedule_event( time() + MINUTE_IN_SECONDS, 'ocwc_every_five_minutes', self::BACKGROUND_BATCH_CRON_HOOK );
-	}
-
-	private static function get_default_background_batch_settings() {
-		return array(
-			'batch_filter'         => 'all',
-			'batch_size'           => 5,
-			'quality'              => 90,
-			'max_width'            => 0,
-			'update_refs'          => 1,
-			'delete_originals'     => 0,
-			'backup_originals'     => 1,
-			'engine'               => 'auto',
-			'cwebp_path'           => 'cwebp',
-			'encoding_effort'      => 6,
-			'sharp_yuv'            => 1,
-			'sharpen_after_resize' => 1,
-			'status'               => 'idle',
-			'started_at'           => '',
-			'last_run_at'          => '',
-			'completed_at'         => '',
-			'processed_count'      => 0,
-			'last_message'         => '',
-			'last_results'         => array(),
-		);
-	}
-
-	private function get_background_batch_settings() {
-		$settings = get_option( self::BACKGROUND_BATCH_OPTION, array() );
-		if ( ! is_array( $settings ) ) {
-			$settings = array();
-		}
-
-		return wp_parse_args( $settings, self::get_default_background_batch_settings() );
-	}
-
-	private function sanitize_batch_filter_value( $value ) {
-		$value = is_string( $value ) ? sanitize_text_field( wp_unslash( $value ) ) : 'all';
-		if ( 'all' !== $value && ! preg_match( '/^\d{4}-\d{2}$/', $value ) ) {
-			$value = 'all';
-		}
-
-		return $value;
-	}
-
-	private function save_background_batch_settings_from_post( $status = 'running' ) {
-		$previous = $this->get_background_batch_settings();
-
-		$settings = array(
-			'batch_filter'         => $this->sanitize_batch_filter_value( $_POST['background_batch_filter'] ?? 'all' ),
-			'batch_size'           => max( 1, min( 10, absint( $_POST['background_batch_size'] ?? 5 ) ) ),
-			'quality'              => max( 1, min( 100, absint( $_POST['background_quality'] ?? 90 ) ) ),
-			'max_width'            => max( 0, absint( $_POST['background_max_width'] ?? 0 ) ),
-			'update_refs'          => ! empty( $_POST['background_update_refs'] ) ? 1 : 0,
-			'delete_originals'     => ! empty( $_POST['background_delete_originals'] ) ? 1 : 0,
-			'backup_originals'     => ! empty( $_POST['background_backup_originals'] ) ? 1 : 0,
-			'engine'               => 'auto',
-			'cwebp_path'           => 'cwebp',
-			'encoding_effort'      => 6,
-			'sharp_yuv'            => 1,
-			'sharpen_after_resize' => 1,
-			'status'               => $status,
-			'started_at'           => current_time( 'mysql' ),
-			'last_run_at'          => '',
-			'completed_at'         => '',
-			'processed_count'      => 0,
-			'last_message'         => 'Background batch is scheduled to start.',
-			'last_results'         => array(),
-		);
-
-		if ( ! empty( $previous['last_results'] ) && 'running' !== $status ) {
-			$settings['last_results'] = $previous['last_results'];
-		}
-
-		update_option( self::BACKGROUND_BATCH_OPTION, $settings, false );
-
-		return $settings;
-	}
-
-	private function get_background_runtime_options( $settings ) {
-		$settings = is_array( $settings ) ? wp_parse_args( $settings, self::get_default_background_batch_settings() ) : self::get_default_background_batch_settings();
-
-		return array(
-			'batch_filter'         => $this->sanitize_batch_filter_value( $settings['batch_filter'] ?? 'all' ),
-			'batch_size'           => max( 1, min( 10, absint( $settings['batch_size'] ?? 5 ) ) ),
-			'quality'              => max( 1, min( 100, absint( $settings['quality'] ?? 90 ) ) ),
-			'max_width'            => max( 0, absint( $settings['max_width'] ?? 0 ) ),
-			'update_refs'          => ! empty( $settings['update_refs'] ) ? 1 : 0,
-			'delete_originals'     => ! empty( $settings['delete_originals'] ) ? 1 : 0,
-			'backup_originals'     => ! empty( $settings['backup_originals'] ) ? 1 : 0,
-			'engine'               => 'auto',
-			'cwebp_path'           => 'cwebp',
-			'encoding_effort'      => 6,
-			'sharp_yuv'            => 1,
-			'sharpen_after_resize' => 1,
-		);
-	}
-
-	public function run_background_batch_cron() {
-		if ( get_transient( self::BACKGROUND_BATCH_LOCK ) ) {
-			return;
-		}
-
-		$settings = $this->get_background_batch_settings();
-		if ( empty( $settings['status'] ) || 'running' !== $settings['status'] ) {
-			self::clear_background_batch_schedule_static();
-			return;
-		}
-
-		set_transient( self::BACKGROUND_BATCH_LOCK, 1, 10 * MINUTE_IN_SECONDS );
-
-		try {
-			$options          = $this->get_background_runtime_options( $settings );
-			$remaining_before = $this->get_remaining_count( $options['batch_filter'], $options['max_width'] );
-
-			if ( $remaining_before <= 0 ) {
-				$settings['status']       = 'complete';
-				$settings['completed_at'] = current_time( 'mysql' );
-				$settings['last_run_at']  = current_time( 'mysql' );
-				$settings['last_message'] = 'Background batch complete. No processable images remain.';
-				update_option( self::BACKGROUND_BATCH_OPTION, $settings, false );
-				self::clear_background_batch_schedule_static();
-				delete_transient( self::BACKGROUND_BATCH_LOCK );
-				return;
-			}
-
-			$results         = $this->run_batch( $options );
-			$remaining_after = $this->get_remaining_count( $options['batch_filter'], $options['max_width'] );
-			$processed       = 0;
-
-			foreach ( $results as $result ) {
-				if ( ! empty( $result['success'] ) && ! empty( $result['id'] ) && is_numeric( $result['id'] ) ) {
-					$processed++;
-				}
-			}
-
-			$settings['last_run_at']     = current_time( 'mysql' );
-			$settings['processed_count'] = (int) ( $settings['processed_count'] ?? 0 ) + $processed;
-			$settings['last_results']    = array_slice( $results, 0, 10 );
-
-			if ( $remaining_after <= 0 ) {
-				$settings['status']       = 'complete';
-				$settings['completed_at'] = current_time( 'mysql' );
-				$settings['last_message'] = 'Background batch complete. Processed ' . (int) $processed . ' image(s) in the final run.';
-				update_option( self::BACKGROUND_BATCH_OPTION, $settings, false );
-				self::clear_background_batch_schedule_static();
-				delete_transient( self::BACKGROUND_BATCH_LOCK );
-				return;
-			}
-
-			if ( 0 === $processed && $remaining_after >= $remaining_before ) {
-				$settings['status']       = 'error';
-				$settings['last_message'] = 'Background batch stopped because the last cron run made no progress.';
-				update_option( self::BACKGROUND_BATCH_OPTION, $settings, false );
-				self::clear_background_batch_schedule_static();
-				delete_transient( self::BACKGROUND_BATCH_LOCK );
-				return;
-			}
-
-			$settings['status']       = 'running';
-			$settings['last_message'] = 'Processed ' . (int) $processed . ' image(s). Remaining: ' . (int) $remaining_after . '.';
-			update_option( self::BACKGROUND_BATCH_OPTION, $settings, false );
-		} catch ( Throwable $e ) {
-			$settings['status']       = 'error';
-			$settings['last_run_at']  = current_time( 'mysql' );
-			$settings['last_message'] = 'Background batch error: ' . $e->getMessage();
-			update_option( self::BACKGROUND_BATCH_OPTION, $settings, false );
-			self::clear_background_batch_schedule_static();
-		}
-
-		delete_transient( self::BACKGROUND_BATCH_LOCK );
-	}
-
-	private function get_remaining_count( $batch_filter = 'all', $max_width = 0 ) {
-		$jpg_png_count = $this->get_jpg_png_remaining_count( $batch_filter );
-		$webp_count    = $this->get_resizable_webp_remaining_count( $batch_filter, $max_width );
-
-		return (int) $jpg_png_count + (int) $webp_count;
-	}
-
-	private function get_jpg_png_remaining_count( $batch_filter = 'all' ) {
+	private function get_remaining_count( $batch_filter = 'all' ) {
 		global $wpdb;
 
 		$table      = self::get_error_log_table_name();
@@ -1418,29 +1052,12 @@ class OC_WebP_Media_Converter {
 		return (int) $wpdb->get_var( $sql );
 	}
 
-	private function get_resizable_webp_remaining_count( $batch_filter = 'all', $max_width = 0 ) {
-		$max_width = max( 0, (int) $max_width );
-		if ( $max_width <= 0 ) {
-			return 0;
-		}
-
-		$count = 0;
-		foreach ( $this->get_webp_candidate_attachment_ids( $batch_filter ) as $attachment_id ) {
-			if ( $this->is_webp_attachment_wider_than( (int) $attachment_id, $max_width ) ) {
-				$count++;
-			}
-		}
-
-		return $count;
-	}
-
-	private function get_candidate_attachment_ids( $limit, $batch_filter = 'all', $max_width = 0 ) {
+	private function get_candidate_attachment_ids( $limit, $batch_filter = 'all' ) {
 		global $wpdb;
 
 		$table      = self::get_error_log_table_name();
 		$limit      = max( 1, (int) $limit );
 		$date_range = $this->get_batch_filter_date_range( $batch_filter );
-		$ids        = array();
 
 		$sql = "SELECT p.ID
 			FROM {$wpdb->posts} p
@@ -1465,96 +1082,8 @@ class OC_WebP_Media_Converter {
 		$args[] = $limit;
 
 		$sql = $wpdb->prepare( $sql, $args );
-		$ids = array_map( 'intval', (array) $wpdb->get_col( $sql ) );
-
-		$remaining_slots = $limit - count( $ids );
-		if ( $remaining_slots <= 0 ) {
-			return $ids;
-		}
-
-		$max_width = max( 0, (int) $max_width );
-		if ( $max_width <= 0 ) {
-			return $ids;
-		}
-
-		foreach ( $this->get_webp_candidate_attachment_ids( $batch_filter ) as $attachment_id ) {
-			$attachment_id = (int) $attachment_id;
-			if ( in_array( $attachment_id, $ids, true ) ) {
-				continue;
-			}
-
-			if ( ! $this->is_webp_attachment_wider_than( $attachment_id, $max_width ) ) {
-				continue;
-			}
-
-			$ids[] = $attachment_id;
-			if ( count( $ids ) >= $limit ) {
-				break;
-			}
-		}
-
-		return $ids;
-	}
-
-	private function get_webp_candidate_attachment_ids( $batch_filter = 'all' ) {
-		global $wpdb;
-
-		$table      = self::get_error_log_table_name();
-		$date_range = $this->get_batch_filter_date_range( $batch_filter );
-
-		$sql = "SELECT p.ID
-			FROM {$wpdb->posts} p
-			LEFT JOIN `{$table}` e ON e.attachment_id = p.ID
-			WHERE p.post_type = 'attachment'
-			AND p.post_status = 'inherit'
-			AND p.post_mime_type = 'image/webp'
-			AND e.attachment_id IS NULL";
-
-		$args = array();
-		if ( ! empty( $date_range ) ) {
-			$sql   .= "
-			AND p.post_date >= %s
-			AND p.post_date < %s";
-			$args[] = $date_range['start'];
-			$args[] = $date_range['end'];
-		}
-
-		$sql .= "
-			ORDER BY p.ID ASC";
-
-		if ( ! empty( $args ) ) {
-			$sql = $wpdb->prepare( $sql, $args );
-		}
 
 		return array_map( 'intval', (array) $wpdb->get_col( $sql ) );
-	}
-
-	private function is_webp_attachment_wider_than( $attachment_id, $max_width ) {
-		$max_width = max( 0, (int) $max_width );
-		if ( $max_width <= 0 ) {
-			return false;
-		}
-
-		$dimensions = $this->get_attachment_dimensions( $attachment_id );
-
-		return ! empty( $dimensions['width'] ) && (int) $dimensions['width'] > $max_width;
-	}
-
-	private function get_attachment_dimensions( $attachment_id ) {
-		$metadata = wp_get_attachment_metadata( $attachment_id );
-		if ( is_array( $metadata ) && ! empty( $metadata['width'] ) && ! empty( $metadata['height'] ) ) {
-			return array(
-				'width'  => (int) $metadata['width'],
-				'height' => (int) $metadata['height'],
-			);
-		}
-
-		$file = get_attached_file( $attachment_id );
-		if ( $file && file_exists( $file ) ) {
-			return $this->get_image_dimensions( $file );
-		}
-
-		return array();
 	}
 
 	private function get_error_log_count() {
@@ -1604,14 +1133,14 @@ class OC_WebP_Media_Converter {
 		}
 
 		$batch_filter   = isset( $options['batch_filter'] ) ? (string) $options['batch_filter'] : 'all';
-		$attachment_ids = $this->get_candidate_attachment_ids( (int) $options['batch_size'], $batch_filter, (int) ( $options['max_width'] ?? 0 ) );
+		$attachment_ids = $this->get_candidate_attachment_ids( (int) $options['batch_size'], $batch_filter );
 
 		if ( empty( $attachment_ids ) ) {
 			return array(
 				array(
 					'id'      => '-',
 					'success' => true,
-					'message' => 'No processable JPG, PNG, or oversized WebP attachments remain for the selected batch filter. Attachments in the error log are skipped until their error entries are deleted.',
+					'message' => 'No processable JPG or PNG attachments remain for the selected batch filter. Attachments in the error log are skipped until their error entries are deleted.',
 				),
 			);
 		}
@@ -1638,12 +1167,8 @@ class OC_WebP_Media_Converter {
 		$old_file = wp_normalize_path( $old_file );
 		$ext      = strtolower( pathinfo( $old_file, PATHINFO_EXTENSION ) );
 
-		if ( 'webp' === $ext ) {
-			return $this->resize_webp_attachment( $attachment_id, $old_file, $options );
-		}
-
 		if ( ! in_array( $ext, array( 'jpg', 'jpeg', 'png' ), true ) ) {
-			return $this->result( $attachment_id, false, 'Not a JPG, JPEG, PNG, or WebP file.' );
+			return $this->result( $attachment_id, false, 'Not a JPG, JPEG, or PNG file.' );
 		}
 
 		$new_file = preg_replace( '/\.(jpe?g|png)$/i', '.webp', $old_file );
@@ -1706,76 +1231,6 @@ class OC_WebP_Media_Converter {
 		}
 
 		$message = 'Converted to ' . basename( $new_file ) . ' using ' . $conversion_result['engine'] . '. DB rows updated: ' . (int) $replacement_count . '. Old files deleted: ' . (int) $deleted_count . '.';
-
-		return $this->result( $attachment_id, true, $message );
-	}
-
-	private function resize_webp_attachment( $attachment_id, $old_file, $options ) {
-		require_once ABSPATH . 'wp-admin/includes/image.php';
-		require_once ABSPATH . 'wp-admin/includes/file.php';
-
-		$max_width = max( 0, (int) ( $options['max_width'] ?? 0 ) );
-		if ( $max_width <= 0 ) {
-			return $this->result( $attachment_id, true, 'WebP already uses WebP format. Set a Maximum width above 0 to resize existing WebP images.' );
-		}
-
-		$dimensions = $this->get_image_dimensions( $old_file );
-		if ( empty( $dimensions['width'] ) || (int) $dimensions['width'] <= $max_width ) {
-			return $this->result( $attachment_id, true, basename( $old_file ) . 'WebP image is already at or below the selected maximum width.' );
-		}
-
-		$old_file = wp_normalize_path( $old_file );
-		$old_meta = wp_get_attachment_metadata( $attachment_id );
-		$old_url  = wp_get_attachment_url( $attachment_id );
-		$old_rel  = get_post_meta( $attachment_id, '_wp_attached_file', true );
-
-		$tmp_file = wp_normalize_path( trailingslashit( dirname( $old_file ) ) . wp_unique_filename( dirname( $old_file ), pathinfo( $old_file, PATHINFO_FILENAME ) . '-ocwc-temp.webp' ) );
-
-		$conversion_result = $this->create_webp_file( $old_file, $tmp_file, $options );
-		if ( is_wp_error( $conversion_result ) ) {
-			return $this->result( $attachment_id, false, $conversion_result->get_error_message() );
-		}
-
-		if ( empty( $conversion_result['path'] ) || ! file_exists( $conversion_result['path'] ) ) {
-			return $this->result( $attachment_id, false, 'Resized WebP file was not created.' );
-		}
-
-		if ( ! empty( $options['backup_originals'] ) ) {
-			$this->backup_file( $old_file );
-		}
-
-		$this->delete_old_generated_files( $old_file, $old_meta );
-
-		if ( ! @rename( $tmp_file, $old_file ) ) {
-			if ( ! @copy( $tmp_file, $old_file ) ) {
-				@unlink( $tmp_file );
-				return $this->result( $attachment_id, false, 'Could not replace the existing WebP file with the resized version.' );
-			}
-			@unlink( $tmp_file );
-		}
-
-		update_attached_file( $attachment_id, $old_file );
-
-		wp_update_post(
-			array(
-				'ID'             => $attachment_id,
-				'post_mime_type' => 'image/webp',
-				'guid'           => $old_url,
-			)
-		);
-
-		$new_meta = $this->generate_attachment_metadata_with_quality( $attachment_id, $old_file, (int) $options['quality'] );
-		if ( is_array( $new_meta ) && ! empty( $new_meta ) ) {
-			wp_update_attachment_metadata( $attachment_id, $new_meta );
-		}
-
-		clean_attachment_cache( $attachment_id );
-		clean_post_cache( $attachment_id );
-
-		$new_dimensions = $this->get_image_dimensions( $old_file );
-		$new_width      = ! empty( $new_dimensions['width'] ) ? (int) $new_dimensions['width'] : $max_width;
-
-		$message = basename( $old_file ) . ' : Resized existing WebP in place to ' . (int) $new_width . 'px wide using ' . $conversion_result['engine'] . '. File name and references were unchanged.';
 
 		return $this->result( $attachment_id, true, $message );
 	}
@@ -2040,7 +1495,6 @@ class OC_WebP_Media_Converter {
 
 		return array(
 			'id'      => $id,
-			'uploaded_month_year' => $this->get_attachment_uploaded_month_year( $id ),
 			'success' => (bool) $success,
 			'message' => $message,
 		);
@@ -2235,36 +1689,6 @@ class OC_WebP_Media_Converter {
 		return $data;
 	}
 
-	private function delete_old_generated_files( $old_file, $old_meta ) {
-		if ( ! is_array( $old_meta ) || empty( $old_meta['sizes'] ) || ! is_array( $old_meta['sizes'] ) ) {
-			return 0;
-		}
-
-		$dir   = dirname( $old_file );
-		$count = 0;
-		$files = array();
-
-		foreach ( $old_meta['sizes'] as $size ) {
-			if ( ! empty( $size['file'] ) ) {
-				$files[] = wp_normalize_path( trailingslashit( $dir ) . $size['file'] );
-			}
-		}
-
-		$files = array_unique( array_filter( $files ) );
-		foreach ( $files as $file ) {
-			$file = wp_normalize_path( $file );
-			if ( $file === wp_normalize_path( $old_file ) || ! file_exists( $file ) || ! $this->is_inside_uploads( $file ) ) {
-				continue;
-			}
-
-			if ( @unlink( $file ) ) {
-				$count++;
-			}
-		}
-
-		return $count;
-	}
-
 	private function delete_old_files( $old_file, $old_meta, $backup_first ) {
 		$files = array( $old_file );
 		$dir   = dirname( $old_file );
@@ -2358,6 +1782,5 @@ class OC_WebP_Media_Converter {
 }
 
 register_activation_hook( __FILE__, array( 'OC_WebP_Media_Converter', 'activate' ) );
-register_deactivation_hook( __FILE__, array( 'OC_WebP_Media_Converter', 'deactivate' ) );
 
 new OC_WebP_Media_Converter();
