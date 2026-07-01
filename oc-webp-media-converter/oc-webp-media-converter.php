@@ -2,9 +2,10 @@
 /**
  * Plugin Name: OC WebP Media Converter
  * Description: Converts JPG/JPEG/PNG Media Library attachments to high-quality WebP, updates attachment records, regenerates image sizes, optionally updates database references, optionally removes original files, and can convert JPG/PNG uploads to WebP automatically.
- * Version: 0.4.1
+ * Version: 0.4.7
  * Author: TriAd/ChatGPT
  * License: GPL-2.0-or-later
+ * Update URI: https://updates.triad-inc.com/oc-webp-media-converter/
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -20,6 +21,10 @@ class OC_WebP_Media_Converter {
 	const DB_VERSION       = '1.0';
 	const DB_VERSION_OPTION = 'oc_webp_media_converter_db_version';
 	const MEDIA_CONVERT_NONCE = 'ocwc_media_convert';
+	const PLUGIN_VERSION       = '0.4.7';
+	const UPDATE_SLUG          = 'oc-webp-media-converter';
+	const UPDATE_MANIFEST_URL  = 'https://updates.triad-inc.com/oc-webp-media-converter/update.json';
+	const UPDATE_CACHE_KEY     = 'oc_webp_media_converter_update_manifest';
 
 	public function __construct() {
 		add_action( 'admin_menu', array( $this, 'add_admin_page' ) );
@@ -29,6 +34,10 @@ class OC_WebP_Media_Converter {
 		add_filter( 'attachment_fields_to_edit', array( $this, 'add_media_library_webp_button' ), 20, 2 );
 		
 		add_action( 'wp_ajax_ocwc_convert_media_attachment_to_webp', array( $this, 'ajax_convert_media_attachment_to_webp' ) );
+		
+		add_filter( 'pre_set_site_transient_update_plugins', array( $this, 'check_for_plugin_update' ) );
+		add_filter( 'plugins_api', array( $this, 'plugin_update_information' ), 20, 3 );
+		add_action( 'upgrader_process_complete', array( $this, 'clear_update_manifest_cache_after_update' ), 10, 2 );
 		
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_scripts' ) );
 	}
@@ -44,6 +53,162 @@ class OC_WebP_Media_Converter {
 			self::create_error_log_table();
 			update_option( self::DB_VERSION_OPTION, self::DB_VERSION );
 		}
+	}
+	
+	private function get_plugin_basename() {
+		return plugin_basename( __FILE__ );
+	}
+
+	private function get_update_manifest( $force_refresh = false ) {
+		if ( ! $force_refresh ) {
+			$cached = get_site_transient( self::UPDATE_CACHE_KEY );
+			if ( is_array( $cached ) ) {
+				return $cached;
+			}
+		}
+
+		$response = wp_remote_get(
+			self::UPDATE_MANIFEST_URL,
+			array(
+				'timeout' => 15,
+				'headers' => array(
+					'Accept' => 'application/json',
+				),
+			)
+		);
+
+		if ( is_wp_error( $response ) ) {
+			return false;
+		}
+
+		$code = (int) wp_remote_retrieve_response_code( $response );
+		if ( 200 !== $code ) {
+			return false;
+		}
+
+		$body = wp_remote_retrieve_body( $response );
+		$data = json_decode( $body, true );
+
+		if ( ! is_array( $data ) || empty( $data['version'] ) || empty( $data['download_url'] ) ) {
+			return false;
+		}
+
+		$data = wp_parse_args(
+			$data,
+			array(
+				'name'         => 'OC WebP Media Converter',
+				'slug'         => self::UPDATE_SLUG,
+				'version'      => '',
+				'download_url' => '',
+				'homepage'     => '',
+				'requires'     => '',
+				'tested'       => '',
+				'requires_php' => '',
+				'last_updated' => '',
+				'sections'     => array(),
+				'banners'      => array(),
+				'icons'        => array(),
+			)
+		);
+
+		set_site_transient( self::UPDATE_CACHE_KEY, $data, 12 * HOUR_IN_SECONDS );
+
+		return $data;
+	}
+
+	public function check_for_plugin_update( $transient ) {
+		if ( empty( $transient ) || ! is_object( $transient ) ) {
+			return $transient;
+		}
+
+		if ( empty( $transient->checked ) || ! is_array( $transient->checked ) ) {
+			return $transient;
+		}
+
+		$plugin_file = $this->get_plugin_basename();
+		$manifest    = $this->get_update_manifest();
+
+		if ( ! is_array( $manifest ) ) {
+			return $transient;
+		}
+
+		$remote_version = isset( $manifest['version'] ) ? (string) $manifest['version'] : '';
+		$download_url   = isset( $manifest['download_url'] ) ? esc_url_raw( $manifest['download_url'] ) : '';
+
+		if ( empty( $remote_version ) || empty( $download_url ) ) {
+			return $transient;
+		}
+
+		$update_object = (object) array(
+			'id'            => self::UPDATE_MANIFEST_URL,
+			'slug'          => self::UPDATE_SLUG,
+			'plugin'        => $plugin_file,
+			'new_version'   => $remote_version,
+			'url'           => ! empty( $manifest['homepage'] ) ? esc_url_raw( $manifest['homepage'] ) : self::UPDATE_MANIFEST_URL,
+			'package'       => $download_url,
+			'tested'        => ! empty( $manifest['tested'] ) ? (string) $manifest['tested'] : '',
+			'requires'      => ! empty( $manifest['requires'] ) ? (string) $manifest['requires'] : '',
+			'requires_php'  => ! empty( $manifest['requires_php'] ) ? (string) $manifest['requires_php'] : '',
+			'icons'         => ! empty( $manifest['icons'] ) && is_array( $manifest['icons'] ) ? $manifest['icons'] : array(),
+			'banners'       => ! empty( $manifest['banners'] ) && is_array( $manifest['banners'] ) ? $manifest['banners'] : array(),
+		);
+
+		if ( version_compare( $remote_version, self::PLUGIN_VERSION, '>' ) ) {
+			$transient->response[ $plugin_file ] = $update_object;
+		} else {
+			$transient->no_update[ $plugin_file ] = $update_object;
+		}
+
+		return $transient;
+	}
+
+	public function plugin_update_information( $result, $action, $args ) {
+		if ( 'plugin_information' !== $action ) {
+			return $result;
+		}
+
+		if ( empty( $args->slug ) || self::UPDATE_SLUG !== $args->slug ) {
+			return $result;
+		}
+
+		$manifest = $this->get_update_manifest( true );
+
+		if ( ! is_array( $manifest ) ) {
+			return $result;
+		}
+
+		return (object) array(
+			'name'          => ! empty( $manifest['name'] ) ? (string) $manifest['name'] : 'OC WebP Media Converter',
+			'slug'          => self::UPDATE_SLUG,
+			'version'       => ! empty( $manifest['version'] ) ? (string) $manifest['version'] : self::PLUGIN_VERSION,
+			'author'        => '<a href="https://triad-inc.com/">TriAd</a>',
+			'author_profile'=> 'https://triad-inc.com/',
+			'homepage'      => ! empty( $manifest['homepage'] ) ? esc_url_raw( $manifest['homepage'] ) : '',
+			'requires'      => ! empty( $manifest['requires'] ) ? (string) $manifest['requires'] : '',
+			'tested'        => ! empty( $manifest['tested'] ) ? (string) $manifest['tested'] : '',
+			'requires_php'  => ! empty( $manifest['requires_php'] ) ? (string) $manifest['requires_php'] : '',
+			'last_updated'  => ! empty( $manifest['last_updated'] ) ? (string) $manifest['last_updated'] : '',
+			'sections'      => ! empty( $manifest['sections'] ) && is_array( $manifest['sections'] ) ? $manifest['sections'] : array(
+				'description' => 'Converts JPG/JPEG/PNG media files to WebP.',
+				'changelog'   => '',
+			),
+			'banners'       => ! empty( $manifest['banners'] ) && is_array( $manifest['banners'] ) ? $manifest['banners'] : array(),
+			'icons'         => ! empty( $manifest['icons'] ) && is_array( $manifest['icons'] ) ? $manifest['icons'] : array(),
+			'download_link' => ! empty( $manifest['download_url'] ) ? esc_url_raw( $manifest['download_url'] ) : '',
+		);
+	}
+
+	public function clear_update_manifest_cache_after_update( $upgrader, $hook_extra ) {
+		if ( empty( $hook_extra['action'] ) || 'update' !== $hook_extra['action'] ) {
+			return;
+		}
+
+		if ( empty( $hook_extra['type'] ) || 'plugin' !== $hook_extra['type'] ) {
+			return;
+		}
+
+		delete_site_transient( self::UPDATE_CACHE_KEY );
+		delete_site_transient( 'update_plugins' );
 	}
 	
 	public function enqueue_admin_scripts( $hook_suffix ) {
