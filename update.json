@@ -2,7 +2,7 @@
   "name": "OC WebP Media Converter",
   "slug": "oc-webp-media-converter",
   "version": "0.5.0",
-  "download_url": "https://updates.triad-inc.com/oc-webp-media-converter/oc-webp-media-converter-0.4.8.zip",
+  "download_url": "https://updates.triad-inc.com/oc-webp-media-converter/oc-webp-media-converter-0.5.0.zip",
   "homepage": "https://triad-inc.com/",
   "requires": "6.0",
   "tested": "6.6",
